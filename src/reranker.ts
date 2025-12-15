@@ -1,31 +1,20 @@
 /**
  * AuroraNotes API - LLM Reranker Module
- * 
+ *
  * Optional LLM-based reranking for improved retrieval quality.
  * Controlled by LLM_RERANK_ENABLED feature flag.
  * Uses minimal tokens and caches results for cost control.
  */
 
-import { GoogleGenAI } from "@google/genai";
 import { ScoredChunk } from "./types";
 import { logInfo, logError, logWarn } from "./utils";
+import { getGenAIClient, isGenAIAvailable } from "./genaiClient";
 
 // Reranker configuration
 const RERANK_MODEL = process.env.RERANK_MODEL || 'gemini-2.0-flash';
 const RERANK_MAX_CHUNKS = 20;        // Max chunks to consider for reranking
 const RERANK_MAX_OUTPUT_TOKENS = 200; // Limit output tokens for cost
 const RERANK_TIMEOUT_MS = 5000;       // Timeout for rerank call
-
-let genaiClient: GoogleGenAI | null = null;
-
-function getGenAIClient(): GoogleGenAI | null {
-  if (!genaiClient) {
-    const apiKey = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
-    if (!apiKey) return null;
-    genaiClient = new GoogleGenAI({ apiKey });
-  }
-  return genaiClient;
-}
 
 /**
  * Build reranking prompt
@@ -156,6 +145,6 @@ export async function llmRerank(
  * Check if LLM reranker is available
  */
 export function isLLMRerankerAvailable(): boolean {
-  return !!getGenAIClient();
+  return isGenAIAvailable();
 }
 

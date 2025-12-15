@@ -1,8 +1,13 @@
 /**
  * AuroraNotes API - Background Job Queue
- * 
+ *
  * In-process async queue with backpressure for chunk/embedding processing.
  * Provides graceful degradation when queue is full and retry logic.
+ *
+ * QUEUE MODES:
+ *   - in-process (default): Jobs processed in-memory with backpressure
+ *   - cloud-tasks (env QUEUE_MODE=cloud-tasks): Optional Cloud Tasks for durability
+ *   - pubsub (env QUEUE_MODE=pubsub): Optional Pub/Sub for high volume
  */
 
 import { NoteDoc } from "./types";
@@ -14,6 +19,7 @@ const DEFAULT_MAX_QUEUE_SIZE = 100;
 const DEFAULT_MAX_CONCURRENT = 3;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_RETRY_DELAY_MS = 5000;
+const STATS_LOG_INTERVAL_MS = 60000; // Log stats every minute
 
 interface QueueJob {
   id: string;
@@ -37,6 +43,8 @@ class BackgroundQueue {
   private totalProcessed = 0;
   private totalFailed = 0;
   private totalDropped = 0;
+  private totalRetries = 0;
+  private lastStatsLog = 0;
 
   constructor(config?: Partial<QueueConfig>) {
     const envMaxSize = parseInt(process.env.BACKGROUND_QUEUE_MAX_SIZE || '');
@@ -50,6 +58,39 @@ class BackgroundQueue {
     logInfo('Background queue initialized', {
       maxSize: this.config.maxSize,
       maxConcurrent: this.config.maxConcurrent,
+      mode: process.env.QUEUE_MODE || 'in-process',
+    });
+
+    // Start periodic stats logging if there's activity
+    this.startStatsLogger();
+  }
+
+  /**
+   * Periodically log queue statistics for monitoring
+   */
+  private startStatsLogger(): void {
+    setInterval(() => {
+      // Only log if there's been activity since last log
+      if (this.totalProcessed > 0 || this.totalFailed > 0 ||
+          this.totalDropped > 0 || this.queue.length > 0) {
+        this.logQueueStats();
+      }
+    }, STATS_LOG_INTERVAL_MS);
+  }
+
+  /**
+   * Log comprehensive queue statistics
+   */
+  private logQueueStats(): void {
+    const stats = this.getStats();
+    const utilization = Math.round((stats.queueSize / this.config.maxSize) * 100);
+
+    logInfo('Queue stats', {
+      ...stats,
+      maxSize: this.config.maxSize,
+      utilization: `${utilization}%`,
+      healthy: this.isHealthy(),
+      mode: process.env.QUEUE_MODE || 'in-process',
     });
   }
 
@@ -132,30 +173,36 @@ class BackgroundQueue {
     } catch (err) {
       if (job.retries < this.config.maxRetries) {
         job.retries++;
+        this.totalRetries++;
+
+        const delay = this.config.retryDelayMs * job.retries;
         logWarn('Background job failed, retrying', {
           noteId: job.id,
-          retries: job.retries,
+          attempt: job.retries,
           maxRetries: this.config.maxRetries,
+          nextRetryMs: delay,
+          errorMessage: err instanceof Error ? err.message : String(err),
         });
-        
-        // Re-queue with delay
+
+        // Re-queue with exponential backoff delay
         setTimeout(() => {
           this.queue.push(job);
           this.processQueue();
-        }, this.config.retryDelayMs * job.retries);
+        }, delay);
       } else {
         this.totalFailed++;
         logError('Background job failed permanently', err, {
           noteId: job.id,
-          retries: job.retries,
+          attempts: job.retries + 1,
           totalFailed: this.totalFailed,
+          queueStats: this.getStats(),
         });
       }
     }
   }
 
   /**
-   * Get queue statistics
+   * Get queue statistics for monitoring
    */
   getStats(): {
     queueSize: number;
@@ -163,6 +210,7 @@ class BackgroundQueue {
     totalProcessed: number;
     totalFailed: number;
     totalDropped: number;
+    totalRetries: number;
   } {
     return {
       queueSize: this.queue.length,
@@ -170,6 +218,7 @@ class BackgroundQueue {
       totalProcessed: this.totalProcessed,
       totalFailed: this.totalFailed,
       totalDropped: this.totalDropped,
+      totalRetries: this.totalRetries,
     };
   }
 

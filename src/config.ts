@@ -39,12 +39,12 @@ export const NOTES_PAGE_LIMIT = envInt('NOTES_PAGE_LIMIT', 50);
 export const MAX_NOTES_PAGE_LIMIT = 100;
 
 // ============================================
-// Chunking Config
+// Chunking Config (tuned for citation accuracy)
 // ============================================
-export const CHUNK_TARGET_SIZE = envInt('CHUNK_TARGET_SIZE', 500);      // Target chars per chunk
-export const CHUNK_MIN_SIZE = envInt('CHUNK_MIN_SIZE', 100);            // Min chars before merging
-export const CHUNK_MAX_SIZE = envInt('CHUNK_MAX_SIZE', 800);            // Max chars per chunk
-export const CHUNK_OVERLAP = envInt('CHUNK_OVERLAP', 50);               // Overlap chars between chunks
+export const CHUNK_TARGET_SIZE = envInt('CHUNK_TARGET_SIZE', 450);      // Slightly smaller for precision (was 500)
+export const CHUNK_MIN_SIZE = envInt('CHUNK_MIN_SIZE', 80);             // Allow smaller chunks (was 100)
+export const CHUNK_MAX_SIZE = envInt('CHUNK_MAX_SIZE', 700);            // Smaller max for focused content (was 800)
+export const CHUNK_OVERLAP = envInt('CHUNK_OVERLAP', 75);               // More overlap for context (was 50)
 
 // ============================================
 // Embeddings Config

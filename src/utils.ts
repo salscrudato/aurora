@@ -194,15 +194,28 @@ export function extractKeywords(query: string): string[] {
     'so', 'than', 'too', 'very', 'just', 'and', 'but', 'if', 'or', 'because',
     'until', 'while', 'about', 'what', 'which', 'who', 'whom', 'this', 'that',
     'these', 'those', 'am', 'it', 'its', 'my', 'your', 'his', 'her', 'their', 'our',
-    'me', 'you', 'him', 'us', 'them', 'i', 'we', 'they', 'he', 'she'
+    'me', 'you', 'him', 'us', 'them', 'i', 'we', 'they', 'he', 'she',
+    'include', 'including', 'tell', 'everything', 'complete', 'give', 'show'
   ]);
 
-  return query
+  // First, extract unique identifiers (uppercase with underscores/numbers) - these get priority
+  const uniqueIdPattern = /\b([A-Z][A-Z0-9_]{2,})\b/g;
+  const uniqueIds: string[] = [];
+  let match;
+  while ((match = uniqueIdPattern.exec(query)) !== null) {
+    uniqueIds.push(match[1].toLowerCase());
+  }
+
+  // Extract regular keywords
+  const regularKeywords = query
     .toLowerCase()
     .replace(/[^\w\s]/g, ' ')
     .split(/\s+/)
-    .filter(word => word.length > 2 && !stopWords.has(word))
-    .slice(0, 10); // Limit keywords
+    .filter(word => word.length > 2 && !stopWords.has(word));
+
+  // Combine: unique IDs first (they're more specific), then regular keywords
+  const combined = [...new Set([...uniqueIds, ...regularKeywords])];
+  return combined.slice(0, 15); // Allow more keywords for better recall
 }
 
 /**

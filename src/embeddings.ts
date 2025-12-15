@@ -5,15 +5,13 @@
  * Includes LRU caching, retry logic, and query normalization.
  */
 
-import { GoogleGenAI } from "@google/genai";
 import {
   EMBEDDING_MODEL,
   EMBEDDING_DIMENSIONS,
   MAX_EMBEDDING_BATCH_SIZE,
 } from "./config";
 import { logInfo, logError, logWarn, hashText } from "./utils";
-
-let genaiClient: GoogleGenAI | null = null;
+import { getGenAIClient, isGenAIAvailable } from "./genaiClient";
 
 // LRU Cache for embeddings by textHash (reduces API costs for repeated/identical content)
 const EMBEDDING_CACHE_MAX_SIZE = parseInt(process.env.EMBEDDING_CACHE_MAX_SIZE || '') || 1000;
@@ -22,20 +20,6 @@ const embeddingCache = new Map<string, { embedding: number[]; timestamp: number 
 // Track cache statistics
 let cacheHits = 0;
 let cacheMisses = 0;
-
-/**
- * Get or initialize the GenAI client
- */
-function getGenAIClient(): GoogleGenAI {
-  if (!genaiClient) {
-    const apiKey = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      throw new Error('GOOGLE_API_KEY or GEMINI_API_KEY environment variable is required');
-    }
-    genaiClient = new GoogleGenAI({ apiKey });
-  }
-  return genaiClient;
-}
 
 /**
  * Normalize text for consistent embedding generation
@@ -221,12 +205,7 @@ export async function generateQueryEmbedding(query: string): Promise<number[]> {
  * Check if embeddings service is available
  */
 export function isEmbeddingsAvailable(): boolean {
-  try {
-    const apiKey = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
-    return !!apiKey;
-  } catch {
-    return false;
-  }
+  return isGenAIAvailable();
 }
 
 /**

@@ -15,7 +15,7 @@ import {
   MAX_NOTES_PAGE_LIMIT
 } from "./config";
 import { NoteDoc, NoteResponse, NotesListResponse } from "./types";
-import { timestampToISO, parseCursor, encodeCursor, logInfo, logError, sanitizeText, isValidTenantId } from "./utils";
+import { timestampToISO, parseCursor, encodeCursor, logInfo, logError, logWarn, sanitizeText, isValidTenantId } from "./utils";
 import { enqueueNoteProcessing } from "./queue";
 
 /**
@@ -91,9 +91,14 @@ export async function createNote(
 /**
  * List notes with cursor-based pagination
  *
- * Note: For backward compatibility with notes created before tenantId was added,
- * we fetch all notes and filter client-side when querying for 'public' tenant.
- * New deployments should use Firestore index on tenantId.
+ * Uses stable ordering: createdAt DESC, id DESC to ensure deterministic pagination.
+ * The cursor encodes both createdAt and id to handle timestamp collisions correctly.
+ *
+ * PREFERRED FIRESTORE INDEX (for best performance):
+ *   Collection: notes
+ *   Fields: tenantId ASC, createdAt DESC, __name__ DESC
+ *
+ * Falls back to client-side filtering if index doesn't exist yet.
  */
 export async function listNotes(
   tenantId: string = DEFAULT_TENANT_ID,
@@ -101,44 +106,61 @@ export async function listNotes(
   cursor?: string
 ): Promise<NotesListResponse> {
   const db = getDb();
-
-  // Enforce limits
   const pageLimit = Math.min(Math.max(1, limit), MAX_NOTES_PAGE_LIMIT);
+  const cursorData = parseCursor(cursor);
 
-  // Build base query - order by createdAt desc
-  // For backward compatibility, we don't filter by tenantId in query
-  // (old notes may not have tenantId field)
+  // Try optimized query with index first, fall back to legacy if index missing
+  try {
+    return await listNotesOptimized(db, tenantId, pageLimit, cursorData);
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    if (errorMessage.includes('FAILED_PRECONDITION') || errorMessage.includes('requires an index')) {
+      logWarn('Notes index not found, using legacy query', { tenantId });
+      return await listNotesLegacy(db, tenantId, pageLimit, cursorData);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Optimized query using composite index
+ */
+async function listNotesOptimized(
+  db: FirebaseFirestore.Firestore,
+  tenantId: string,
+  pageLimit: number,
+  cursorData: { createdAt: Date; id: string } | null
+): Promise<NotesListResponse> {
   let query = db
     .collection(NOTES_COLLECTION)
+    .where('tenantId', '==', tenantId)
     .orderBy('createdAt', 'desc')
-    .limit(pageLimit + 1); // Fetch one extra to detect hasMore
+    .orderBy('__name__', 'desc')
+    .limit(pageLimit + 1);
 
-  // Apply cursor if provided
-  const cursorData = parseCursor(cursor);
   if (cursorData) {
-    query = query.startAfter(Timestamp.fromDate(cursorData.createdAt));
+    query = query.startAfter(
+      Timestamp.fromDate(cursorData.createdAt),
+      cursorData.id
+    );
   }
 
   const snap = await query.get();
 
-  // Map and filter by tenantId (for backward compatibility)
-  // Notes without tenantId are treated as 'public'
-  const allDocs = snap.docs.map(d => {
+  // Map documents to NoteDoc (no client-side filtering needed anymore)
+  const docs = snap.docs.map(d => {
     const data = d.data() as NoteDoc;
-    // Set default tenantId if missing (backward compatibility)
+    // Ensure tenantId is set (should always be present after backfill)
     if (!data.tenantId) {
       data.tenantId = DEFAULT_TENANT_ID;
     }
     return data;
   });
 
-  // Filter by tenantId
-  const docs = allDocs.filter(d => d.tenantId === tenantId);
-  
   // Determine if there are more results
   const hasMore = docs.length > pageLimit;
   const resultDocs = hasMore ? docs.slice(0, pageLimit) : docs;
-  
+
   // Build next cursor from last result
   let nextCursor: string | null = null;
   if (hasMore && resultDocs.length > 0) {
@@ -146,7 +168,58 @@ export async function listNotes(
     const lastCreatedAt = lastDoc.createdAt as Timestamp;
     nextCursor = encodeCursor(lastCreatedAt, lastDoc.id);
   }
-  
+
+  return {
+    notes: resultDocs.map(docToResponse),
+    cursor: nextCursor,
+    hasMore,
+  };
+}
+
+/**
+ * Legacy query fallback - uses client-side filtering when index doesn't exist
+ */
+async function listNotesLegacy(
+  db: FirebaseFirestore.Firestore,
+  tenantId: string,
+  pageLimit: number,
+  cursorData: { createdAt: Date; id: string } | null
+): Promise<NotesListResponse> {
+  // Fetch more than needed to account for client-side filtering
+  const fetchLimit = pageLimit * 3;
+
+  let query = db
+    .collection(NOTES_COLLECTION)
+    .orderBy('createdAt', 'desc')
+    .limit(fetchLimit + 1);
+
+  if (cursorData) {
+    query = query.startAfter(Timestamp.fromDate(cursorData.createdAt));
+  }
+
+  const snap = await query.get();
+
+  // Client-side filtering (legacy mode)
+  const allDocs = snap.docs.map(d => {
+    const data = d.data() as NoteDoc;
+    if (!data.tenantId) {
+      data.tenantId = DEFAULT_TENANT_ID;
+    }
+    return data;
+  });
+
+  const docs = allDocs.filter(d => d.tenantId === tenantId);
+
+  const hasMore = docs.length > pageLimit;
+  const resultDocs = hasMore ? docs.slice(0, pageLimit) : docs;
+
+  let nextCursor: string | null = null;
+  if (hasMore && resultDocs.length > 0) {
+    const lastDoc = resultDocs[resultDocs.length - 1];
+    const lastCreatedAt = lastDoc.createdAt as Timestamp;
+    nextCursor = encodeCursor(lastCreatedAt, lastDoc.id);
+  }
+
   return {
     notes: resultDocs.map(docToResponse),
     cursor: nextCursor,

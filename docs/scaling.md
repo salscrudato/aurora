@@ -4,10 +4,32 @@ This document explains the architecture decisions for scaling AuroraNotes to han
 
 ## Overview
 
-The scalability strategy is built on three pillars:
+The scalability strategy is built on four pillars:
 1. **Cursor-based pagination** - Never load all notes at once
 2. **Derived collections** - Pre-compute chunks for fast retrieval
 3. **Tenant isolation** - Ready for multi-user/multi-tenant
+4. **Hybrid retrieval** - Combine vector + keyword + recency for best relevance
+
+## Retrieval Strategy
+
+AuroraNotes uses a **two-tier hybrid retrieval** system:
+
+### Tier A: Firestore Hybrid (Default)
+- **Vector Similarity** (0.45 weight): Semantic search via embeddings
+- **BM25 Keywords** (0.35 weight): Lexical matching for exact terms
+- **Recency** (0.20 weight): Exponential decay from query time
+
+### Query-Aware Time Windows
+- **Entity queries** (UUIDs, ticket IDs): Expand to 365 days
+- **Historical queries** ("all time", "ever"): Expand to 365 days
+- **Normal queries**: Default 90 days
+
+### Tier B: Vertex Vector Search (Optional)
+For >100k chunks, enable Vertex AI Vector Search:
+```bash
+VERTEX_VECTOR_SEARCH_ENABLED=true
+VERTEX_VECTOR_SEARCH_ENDPOINT=your-endpoint
+```
 
 ## Notes Collection Schema
 
@@ -129,20 +151,60 @@ timeout: 30s
 - Use `startAfter()` instead of `offset()`
 - Cache frequently accessed data (future)
 
+## Evaluation Scripts
+
+### API Contract Tests
+```bash
+API_URL=http://localhost:8080 npx ts-node scripts/test-api-contracts.ts
+```
+
+### Retrieval Quality Evaluation
+```bash
+npx ts-node scripts/eval-retrieval.ts [API_URL]
+```
+
+Metrics: pass rate, latency, citation validity, multi-source coverage.
+
+### Generate Large Dataset
+```bash
+npx ts-node scripts/eval-retrieval.ts --seed 50000
+```
+
+### TenantId Backfill (required for pagination)
+```bash
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json npx ts-node scripts/backfill-tenant-ids.ts
+```
+
+## GenAI Authentication Modes
+
+```bash
+# Development: API Key
+GENAI_MODE=apikey
+GOOGLE_API_KEY=your-key
+
+# Production: Vertex AI with ADC
+GENAI_MODE=vertex
+GOOGLE_CLOUD_PROJECT=your-project
+```
+
 ## Future Enhancements
 
-1. **Async Embeddings**: Queue large notes for background processing
-2. **Vector Index**: Use Vertex AI Vector Search for O(log n) retrieval
+1. **Async Embeddings**: Queue large notes for background processing (✅ implemented)
+2. **Vector Index**: Use Vertex AI Vector Search for O(log n) retrieval (interface ready)
 3. **Caching Layer**: Redis/Memorystore for hot data
 4. **Sharding**: Partition by tenant for massive scale
 
 ## Monitoring
 
-Key metrics to track:
+Key metrics to track (all in structured JSON logs):
 
-- Notes per query (should be ≤ page limit)
-- Chunks per retrieval (should be ≤ K)
-- Embedding generation latency
-- LLM response time
-- Firestore read/write counts
+- `candidatesFetched`, `chunksUsed` - Retrieval depth
+- `citationsUsed`, `citationCoverage` - Answer quality
+- `timing.retrievalMs`, `timing.generationMs` - Latency breakdown
+- Queue stats: `totalProcessed`, `totalDropped`, `totalRetries`
+
+Filter high latency:
+```bash
+jq 'select(.timing.totalMs > 2000)'
+```
 

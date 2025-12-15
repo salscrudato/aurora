@@ -187,33 +187,127 @@ function findNaturalBreak(text: string, target: number): number {
 }
 
 /**
+ * Compute a hash of the full note text for idempotency checking
+ */
+function computeNoteTextHash(text: string): string {
+  return hashText(text);
+}
+
+/**
  * Process a note into chunks and store them
+ *
+ * IDEMPOTENT: Skips processing if note text hasn't changed (based on hash).
+ * Only regenerates embeddings for chunks that are missing them.
  */
 export async function processNoteChunks(note: NoteDoc): Promise<void> {
   const db = getDb();
   const startTime = Date.now();
-  
+  const noteTextHash = computeNoteTextHash(note.text);
+
   try {
-    // Delete existing chunks for this note
-    const existingChunks = await db
-      .collection(CHUNKS_COLLECTION)
-      .where('noteId', '==', note.id)
-      .get();
-    
-    if (!existingChunks.empty) {
+    // Fetch existing chunks for this note (with fallback if index missing)
+    let existingChunks: ChunkDoc[] = [];
+    try {
+      const existingChunksSnap = await db
+        .collection(CHUNKS_COLLECTION)
+        .where('noteId', '==', note.id)
+        .orderBy('position', 'asc')
+        .get();
+      existingChunks = existingChunksSnap.docs.map(d => d.data() as ChunkDoc);
+    } catch (indexErr: unknown) {
+      const errMsg = indexErr instanceof Error ? indexErr.message : String(indexErr);
+      if (errMsg.includes('FAILED_PRECONDITION') || errMsg.includes('requires an index')) {
+        // Fallback: query without orderBy, sort in memory
+        const fallbackSnap = await db
+          .collection(CHUNKS_COLLECTION)
+          .where('noteId', '==', note.id)
+          .get();
+        existingChunks = fallbackSnap.docs
+          .map(d => d.data() as ChunkDoc)
+          .sort((a, b) => a.position - b.position);
+      } else {
+        throw indexErr;
+      }
+    }
+
+    // Check if note text has changed by comparing content hashes
+    // If chunks exist and their combined hashes match, skip reprocessing
+    if (existingChunks.length > 0) {
+      const existingHashes = existingChunks.map(c => c.textHash).join('|');
+      const newTextChunks = splitIntoChunks(note.text);
+      const newHashes = newTextChunks.map(t => hashText(t)).join('|');
+
+      if (existingHashes === newHashes) {
+        // Note hasn't changed - check if any chunks need embeddings
+        const chunksMissingEmbeddings = existingChunks.filter(c => !c.embedding);
+
+        if (chunksMissingEmbeddings.length === 0) {
+          logInfo('Note unchanged and all embeddings present, skipping', {
+            noteId: note.id,
+            chunkCount: existingChunks.length,
+          });
+          return;
+        }
+
+        // Only regenerate missing embeddings
+        if (EMBEDDINGS_ENABLED && chunksMissingEmbeddings.length > 0) {
+          logInfo('Regenerating missing embeddings', {
+            noteId: note.id,
+            missingCount: chunksMissingEmbeddings.length,
+            totalChunks: existingChunks.length,
+          });
+
+          try {
+            const textsToEmbed = chunksMissingEmbeddings.map(c => c.text);
+            const embeddings = await generateEmbeddings(textsToEmbed);
+
+            const batch = db.batch();
+            for (let i = 0; i < chunksMissingEmbeddings.length && i < embeddings.length; i++) {
+              const chunkRef = db.collection(CHUNKS_COLLECTION).doc(chunksMissingEmbeddings[i].chunkId);
+              batch.update(chunkRef, {
+                embedding: embeddings[i],
+                embeddingModel: 'text-embedding-004',
+              });
+            }
+            await batch.commit();
+
+            logInfo('Missing embeddings regenerated', {
+              noteId: note.id,
+              embeddingsAdded: Math.min(chunksMissingEmbeddings.length, embeddings.length),
+              elapsedMs: Date.now() - startTime,
+            });
+          } catch (err) {
+            logError('Embedding regeneration failed', err, { noteId: note.id });
+          }
+        }
+        return;
+      }
+    }
+
+    // Note has changed - full reprocessing required
+    logInfo('Note changed, reprocessing chunks', {
+      noteId: note.id,
+      hadExistingChunks: existingChunks.length > 0,
+    });
+
+    // Delete existing chunks by fetching fresh references
+    if (existingChunks.length > 0) {
       const deleteBatch = db.batch();
-      existingChunks.docs.forEach(doc => deleteBatch.delete(doc.ref));
+      for (const chunk of existingChunks) {
+        const docRef = db.collection(CHUNKS_COLLECTION).doc(chunk.chunkId);
+        deleteBatch.delete(docRef);
+      }
       await deleteBatch.commit();
     }
-    
+
     // Split note into chunks
     const textChunks = splitIntoChunks(note.text);
-    
+
     if (textChunks.length === 0) {
       logInfo('Note too short for chunking', { noteId: note.id });
       return;
     }
-    
+
     // Create chunk documents
     const chunks: ChunkDoc[] = textChunks.map((text, position) => ({
       chunkId: `${note.id}_${String(position).padStart(3, '0')}`,

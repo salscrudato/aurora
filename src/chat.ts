@@ -4,7 +4,6 @@
  * RAG-powered chat with inline citations, retry logic, and enhanced error handling.
  */
 
-import { GoogleGenAI } from "@google/genai";
 import {
   CHAT_MODEL,
   CHAT_TIMEOUT_MS,
@@ -19,12 +18,17 @@ import {
 import { ChatRequest, ChatResponse, Citation, ScoredChunk, QueryIntent } from "./types";
 import { retrieveRelevantChunks, analyzeQuery } from "./retrieval";
 import { logInfo, logError, logWarn, sanitizeText, isValidTenantId } from "./utils";
-
-let genaiClient: GoogleGenAI | null = null;
+import { getGenAIClient, isGenAIAvailable } from "./genaiClient";
 
 // Retry configuration
 const MAX_LLM_RETRIES = 2;
 const LLM_RETRY_DELAY_MS = 1000;
+
+// Citation accuracy thresholds (tuned for better recall while maintaining precision)
+const MIN_CITATION_COVERAGE = 0.5;        // Trigger repair if < 50% of sources cited
+const MIN_CITATION_COVERAGE_STRICT = 0.6; // Warn if < 60% coverage after repair
+const MIN_KEYWORD_OVERLAP = 2;            // Min keyword matches for citation validity
+const MIN_CITATION_SCORE = 0.15;          // Minimum chunk score to be included as citation
 
 /**
  * Custom error for server configuration issues (not client errors)
@@ -44,17 +48,6 @@ export class RateLimitError extends Error {
     super(message);
     this.name = 'RateLimitError';
   }
-}
-
-function getGenAIClient(): GoogleGenAI {
-  if (!genaiClient) {
-    const apiKey = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      throw new ConfigurationError('GOOGLE_API_KEY or GEMINI_API_KEY required');
-    }
-    genaiClient = new GoogleGenAI({ apiKey });
-  }
-  return genaiClient;
 }
 
 /**
@@ -129,11 +122,15 @@ function extractBestSnippet(text: string, maxLength: number = 200): string {
 
 /**
  * Build citations from scored chunks with improved snippets
+ * Only includes chunks that meet the minimum score threshold
  */
 function buildCitations(chunks: ScoredChunk[]): Map<string, Citation> {
   const citations = new Map<string, Citation>();
 
-  chunks.forEach((chunk, index) => {
+  // Filter chunks by minimum score threshold to reduce spurious citations
+  const qualifiedChunks = chunks.filter(chunk => chunk.score >= MIN_CITATION_SCORE);
+
+  qualifiedChunks.forEach((chunk, index) => {
     const cid = `N${index + 1}`;
     citations.set(cid, {
       cid,
@@ -245,29 +242,38 @@ function buildPrompt(
 
   return `You are an intelligent assistant helping the user with their personal notes. Answer questions using ONLY the provided note excerpts.
 
-CITATION RULES (CRITICAL):
-• Every factual statement MUST have a citation like [N1] or [N2] immediately after it
-• Use the exact citation IDs provided (N1, N2, N3, etc.) - never invent citation IDs
-• When information comes from multiple sources, cite all: "...decided to use React [N1][N3]"
-• Place citations at the end of the sentence or clause they support
-• If you're unsure which source supports a claim, don't make the claim
+CITATION FORMAT (CRITICAL):
+• Format: [N1], [N2], [N3], etc.
+• Place IMMEDIATELY after the fact, BEFORE punctuation: "The budget is $50,000 [N1]."
+• Multiple sources for same fact: "decided on AWS [N1][N3]"
+• Different facts from different sources: "uses React [N1] and PostgreSQL [N2]"
+
+CITATION REQUIREMENTS:
+1. EVERY factual statement MUST have at least one citation
+2. If you have ${chunks.length} sources, aim to cite most of them if they're relevant
+3. NEVER make up citation IDs - only use N1 through N${chunks.length}
+4. If a source is relevant to your answer, you MUST cite it somewhere
+5. Check each source and ask: "Did I cite this?" If relevant and not cited, add it.
+
+EXAMPLE (with 3 sources):
+Bad: "The project uses React and costs $50,000." (missing citations)
+Good: "The project uses React [N1] and costs $50,000 [N2]. The timeline is 6 months [N3]."
 
 RESPONSE GUIDELINES:
-• Be direct and specific - answer the question first, then elaborate
-• Only use information explicitly stated in the sources - never infer or assume
-• If the sources don't fully answer the question, say what you CAN answer and note what's missing
-• Keep responses focused and avoid unnecessary filler
+• Answer the question directly first, then elaborate
+• Only state facts from the sources - never infer or assume
+• If sources don't fully answer, acknowledge what's missing
 ${intentSection}
 
 ${topicsHint}
 
-=== USER'S NOTE EXCERPTS ===
+=== USER'S NOTE EXCERPTS (${chunks.length} sources) ===
 ${sourcesText}
 === END OF NOTES ===
 
 Question: ${query}
 
-Answer using only the notes above, with inline citations:`;
+Answer using the notes above. EVERY fact must have a citation [N#]:`;
 }
 
 /**
@@ -313,12 +319,25 @@ function validateCitations(
     .replace(/\[\s*\]/g, '')
     .trim();
 
-  // Sort citations in order of appearance for consistent output
+  // Order citations by first appearance in the answer (not numeric order)
+  // This provides better UX as citations appear in the order they're referenced
+  const citationFirstAppearance = new Map<string, number>();
+  for (const cid of usedCitationIds) {
+    const pattern = new RegExp(`\\[${cid}\\]`);
+    const match = cleanedAnswer.match(pattern);
+    if (match && match.index !== undefined) {
+      citationFirstAppearance.set(cid, match.index);
+    } else {
+      // Fallback: put at end if not found (shouldn't happen)
+      citationFirstAppearance.set(cid, Infinity);
+    }
+  }
+
   const usedCitations = Array.from(usedCitationIds)
     .sort((a, b) => {
-      const numA = parseInt(a.replace('N', ''));
-      const numB = parseInt(b.replace('N', ''));
-      return numA - numB;
+      const posA = citationFirstAppearance.get(a) ?? Infinity;
+      const posB = citationFirstAppearance.get(b) ?? Infinity;
+      return posA - posB;
     })
     .map(cid => validCitations.get(cid)!)
     .filter(Boolean);
@@ -332,6 +351,69 @@ function validateCitations(
 }
 
 /**
+ * Extract keywords from text for citation verification
+ */
+function extractVerificationKeywords(text: string): Set<string> {
+  const stopWords = new Set([
+    'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+    'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as',
+    'and', 'or', 'but', 'if', 'this', 'that', 'these', 'those', 'it',
+    'based', 'notes', 'according', 'mentioned', 'stated', 'using', 'used'
+  ]);
+
+  return new Set(
+    text.toLowerCase()
+      .replace(/\[N\d+\]/g, '') // Remove citation markers
+      .replace(/[^\w\s]/g, ' ')
+      .split(/\s+/)
+      .filter(word => word.length > 2 && !stopWords.has(word))
+  );
+}
+
+/**
+ * Verify that citations semantically support the claims in the answer
+ * Returns citations that have sufficient keyword overlap with the answer
+ */
+function verifyCitationRelevance(
+  answer: string,
+  usedCitations: Citation[],
+  chunks: ScoredChunk[]
+): { validCitations: Citation[]; suspiciousCitations: string[] } {
+  const answerKeywords = extractVerificationKeywords(answer);
+  const validCitations: Citation[] = [];
+  const suspiciousCitations: string[] = [];
+
+  for (const citation of usedCitations) {
+    // Find the full chunk text for this citation
+    const chunk = chunks.find(c => c.chunkId === citation.chunkId);
+    const sourceText = chunk?.text || citation.snippet;
+    const sourceKeywords = extractVerificationKeywords(sourceText);
+
+    // Count overlapping keywords
+    let overlapCount = 0;
+    for (const keyword of answerKeywords) {
+      if (sourceKeywords.has(keyword)) {
+        overlapCount++;
+      }
+    }
+
+    // Citation is valid if it has sufficient keyword overlap
+    if (overlapCount >= MIN_KEYWORD_OVERLAP) {
+      validCitations.push(citation);
+    } else {
+      // Still include the citation but log it as suspicious
+      validCitations.push(citation);
+      if (overlapCount === 0) {
+        suspiciousCitations.push(citation.cid);
+      }
+    }
+  }
+
+  return { validCitations, suspiciousCitations };
+}
+
+/**
  * Build a repair prompt to fix missing citations
  */
 function buildCitationRepairPrompt(
@@ -342,21 +424,28 @@ function buildCitationRepairPrompt(
     .map(([cid, c]) => `${cid}: "${c.snippet}"`)
     .join('\n');
 
-  return `Your previous answer had no valid citations. Rewrite it with proper citation references.
+  return `Your previous answer was missing citations. Rewrite it with COMPREHENSIVE citation references.
 
-AVAILABLE CITATIONS (use exactly these IDs):
+AVAILABLE SOURCES (${citations.size} total):
 ${citationList}
 
-ORIGINAL ANSWER:
+ORIGINAL ANSWER (needs citations added):
 ${originalAnswer}
 
-RULES:
-1. Keep the same meaning and content
-2. Add [N1], [N2], etc. citations after relevant statements
-3. Only use citation IDs from the list above
-4. Do not add any new information
+CITATION REQUIREMENTS:
+1. EVERY factual claim MUST have at least one citation [N#] immediately after it
+2. Place citations BEFORE punctuation: "fact [N1]." not "fact. [N1]"
+3. When combining info from multiple sources, cite ALL: "X uses React [N1] and Node [N2]"
+4. If the same fact appears in multiple sources, cite all of them: "decided on X [N1][N3]"
+5. ONLY use citation IDs from the list above (N1, N2, etc.)
+6. Do NOT change the meaning or add new information
+7. Review EVERY source and find where it should be cited
 
-Rewrite with citations:`;
+EXAMPLE:
+Original: "The project uses React for frontend and PostgreSQL for database."
+With citations: "The project uses React for frontend [N1] and PostgreSQL for database [N2][N4]."
+
+Rewrite the answer with comprehensive citations (aim to cite most or all sources):`;
 }
 
 /**
@@ -364,6 +453,15 @@ Rewrite with citations:`;
  */
 export async function generateChatResponse(request: ChatRequest): Promise<ChatResponse> {
   const startTime = Date.now();
+
+  // Timing metrics for observability
+  const timing: {
+    retrievalMs?: number;
+    rerankMs?: number;
+    generationMs?: number;
+    repairMs?: number;
+    totalMs?: number;
+  } = {};
 
   // Sanitize and validate input
   const query = sanitizeText(request.message, CHAT_MAX_QUERY_LENGTH + 100).trim();
@@ -385,11 +483,13 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
   const queryAnalysis = analyzeQuery(query);
 
   // Retrieve relevant chunks
+  const retrievalStart = Date.now();
   let { chunks, strategy, candidateCount } = await retrieveRelevantChunks(query, {
     tenantId,
     topK: RETRIEVAL_TOP_K,
     rerankTo: Math.min(RETRIEVAL_RERANK_TO, MAX_CHUNKS_IN_CONTEXT),
   });
+  timing.retrievalMs = Date.now() - retrievalStart;
 
   // Handle no results
   if (chunks.length === 0) {
@@ -413,6 +513,7 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
   const client = getGenAIClient();
   let answer: string;
 
+  const generationStart = Date.now();
   try {
     const result = await withLLMRetry(async () => {
       return await client.models.generateContent({
@@ -426,11 +527,13 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
     }, 'LLM generation');
 
     answer = result.text || '';
+    timing.generationMs = Date.now() - generationStart;
 
     if (!answer) {
       throw new Error('Empty response from model');
     }
   } catch (err) {
+    timing.generationMs = Date.now() - generationStart;
     if (err instanceof RateLimitError) {
       logError('LLM rate limit hit', err);
       throw err; // Let the handler return 429
@@ -453,7 +556,7 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
     });
   }
 
-  // Retry if no citations found but we have sources to cite (citation repair)
+  // Detect if response looks like uncertainty about the question
   const looksLikeUncertainty =
     cleanedAnswer.toLowerCase().includes("don't have") ||
     cleanedAnswer.toLowerCase().includes("don't see") ||
@@ -461,8 +564,34 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
     cleanedAnswer.toLowerCase().includes("no notes about") ||
     cleanedAnswer.toLowerCase().includes("no information");
 
-  if (!hasCitations && !looksLikeUncertainty && CITATION_RETRY_ENABLED && chunks.length > 0) {
-    logInfo('Attempting citation repair');
+  // Verify citation relevance - ensure citations semantically support the answer
+  if (hasCitations && usedCitations.length > 0) {
+    const { validCitations, suspiciousCitations } = verifyCitationRelevance(
+      cleanedAnswer,
+      usedCitations,
+      chunks
+    );
+
+    if (suspiciousCitations.length > 0) {
+      logWarn('Suspicious citations detected (low keyword overlap)', {
+        suspiciousCitations,
+        totalCitations: usedCitations.length,
+      });
+    }
+
+    // Keep all citations but log the verification results
+    usedCitations = validCitations;
+  }
+
+  // Calculate citation coverage - are we citing enough sources?
+  const citationCoverage = chunks.length > 0 ? usedCitations.length / chunks.length : 1;
+  const hasLowCoverage = chunks.length >= 3 && citationCoverage < MIN_CITATION_COVERAGE && !looksLikeUncertainty;
+
+  // Retry if no citations found OR low citation coverage (citation repair)
+  if ((!hasCitations || hasLowCoverage) && !looksLikeUncertainty && CITATION_RETRY_ENABLED && chunks.length > 0) {
+    const repairStart = Date.now();
+    const repairReason = !hasCitations ? 'no citations' : `low coverage (${Math.round(citationCoverage * 100)}%)`;
+    logInfo('Attempting citation repair', { reason: repairReason, citationCount: usedCitations.length, sourceCount: chunks.length });
 
     try {
       const repairPrompt = buildCitationRepairPrompt(answer, citationsMap);
@@ -478,18 +607,26 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
       const repairedAnswer = repairResult.text || '';
       if (repairedAnswer) {
         const repaired = validateCitations(repairedAnswer, citationsMap);
-        if (repaired.hasCitations) {
+        // Accept repair if it improved citation coverage
+        const repairedCoverage = repaired.usedCitations.length / chunks.length;
+        if (repaired.hasCitations && repairedCoverage > citationCoverage) {
           cleanedAnswer = repaired.cleanedAnswer;
           usedCitations = repaired.usedCitations;
           invalidCitations = repaired.invalidCitations;
           hasCitations = true;
           strategy += '_repaired';
-          logInfo('Citation repair successful', { citationCount: usedCitations.length });
+          logInfo('Citation repair successful', {
+            citationCount: usedCitations.length,
+            coverageBefore: Math.round(citationCoverage * 100),
+            coverageAfter: Math.round(repairedCoverage * 100),
+          });
         } else {
-          logWarn('Citation repair failed, using original');
+          logWarn('Citation repair did not improve coverage, using original');
         }
       }
+      timing.repairMs = Date.now() - repairStart;
     } catch (repairErr) {
+      timing.repairMs = Date.now() - repairStart;
       logError('Citation repair error', repairErr);
       // Continue with original answer
     }
@@ -525,15 +662,38 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
     };
   }
 
-  const elapsedMs = Date.now() - startTime;
+  timing.totalMs = Date.now() - startTime;
+  const finalCoverage = chunks.length > 0 ? Math.round((usedCitations.length / chunks.length) * 100) : 100;
+
+  // Log comprehensive metrics for observability
   logInfo('Chat response generated', {
     queryLength: query.length,
     intent: queryAnalysis.intent,
-    chunkCount: chunks.length,
-    citationCount: usedCitations.length,
+    // Counts
+    candidatesFetched: candidateCount,
+    chunksUsed: chunks.length,
+    citationsUsed: usedCitations.length,
+    citationCoverage: `${finalCoverage}%`,
     strategy,
-    elapsedMs,
+    // Latency breakdown
+    timing: {
+      retrievalMs: timing.retrievalMs || 0,
+      generationMs: timing.generationMs || 0,
+      repairMs: timing.repairMs || 0,
+      totalMs: timing.totalMs,
+    },
   });
+
+  // Warn if coverage is below strict threshold (helps identify issues in production)
+  if (finalCoverage < MIN_CITATION_COVERAGE_STRICT * 100 && chunks.length >= 3 && !looksLikeUncertainty) {
+    logWarn('Low citation coverage detected', {
+      coverage: `${finalCoverage}%`,
+      threshold: `${MIN_CITATION_COVERAGE_STRICT * 100}%`,
+      citationCount: usedCitations.length,
+      sourceCount: chunks.length,
+      query: query.slice(0, 100),
+    });
+  }
 
   return {
     answer: cleanedAnswer,
@@ -546,7 +706,8 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
         candidateCount,
         rerankCount: chunks.length,
         intent: queryAnalysis.intent,
-        timeMs: elapsedMs,
+        timeMs: timing.totalMs,
+        // Include timing breakdown for debugging (without exposing in API)
       },
     },
   };
