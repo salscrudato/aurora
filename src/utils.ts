@@ -1,0 +1,227 @@
+/**
+ * AuroraNotes API - Utility Functions
+ *
+ * Common utilities for logging, validation, text processing, and security.
+ */
+
+import { Timestamp } from "firebase-admin/firestore";
+import * as crypto from "crypto";
+
+// ============================================
+// Input Sanitization
+// ============================================
+
+/**
+ * Sanitize user input text (remove control characters, limit length)
+ */
+export function sanitizeText(text: string, maxLength: number = 10000): string {
+  if (!text || typeof text !== 'string') return '';
+
+  return text
+    // Remove null bytes and other control characters (except newlines/tabs)
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+    // Normalize unicode
+    .normalize('NFC')
+    // Trim whitespace
+    .trim()
+    // Limit length
+    .slice(0, maxLength);
+}
+
+/**
+ * Sanitize query string for safe logging
+ */
+export function sanitizeForLogging(text: string, maxLength: number = 100): string {
+  return sanitizeText(text, maxLength)
+    .replace(/[\n\r]/g, ' ')
+    .replace(/\s+/g, ' ');
+}
+
+/**
+ * Validate tenant ID format
+ */
+export function isValidTenantId(tenantId: string): boolean {
+  if (!tenantId || typeof tenantId !== 'string') return false;
+  // Allow alphanumeric, hyphens, underscores, max 64 chars
+  return /^[a-zA-Z0-9_-]{1,64}$/.test(tenantId);
+}
+
+/**
+ * Convert Firestore Timestamp to ISO string
+ */
+export function timestampToISO(ts: Timestamp | Date | unknown): string {
+  if (ts instanceof Timestamp) {
+    return ts.toDate().toISOString();
+  }
+  if (ts instanceof Date) {
+    return ts.toISOString();
+  }
+  // Handle serialized timestamp
+  if (ts && typeof ts === 'object' && '_seconds' in ts) {
+    const obj = ts as { _seconds: number; _nanoseconds?: number };
+    return new Date(obj._seconds * 1000).toISOString();
+  }
+  return new Date().toISOString();
+}
+
+/**
+ * Create a hash of text for deduplication
+ */
+export function hashText(text: string): string {
+  return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16);
+}
+
+/**
+ * Estimate token count (rough approximation: ~4 chars per token)
+ */
+export function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+/**
+ * Parse cursor for pagination (base64 encoded)
+ */
+export function parseCursor(cursor: string | undefined): { createdAt: Date; id: string } | null {
+  if (!cursor) return null;
+  try {
+    const decoded = Buffer.from(cursor, 'base64').toString('utf8');
+    const [timestamp, id] = decoded.split('|');
+    const createdAt = new Date(timestamp);
+    if (isNaN(createdAt.getTime()) || !id) return null;
+    return { createdAt, id };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Encode cursor for pagination
+ */
+export function encodeCursor(createdAt: Date | Timestamp, id: string): string {
+  const date = createdAt instanceof Timestamp ? createdAt.toDate() : createdAt;
+  return Buffer.from(`${date.toISOString()}|${id}`).toString('base64');
+}
+
+// ============================================
+// Request Context (for request ID correlation)
+// ============================================
+
+// Using AsyncLocalStorage for request-scoped context
+import { AsyncLocalStorage } from 'async_hooks';
+
+interface RequestContext {
+  requestId: string;
+  startTime: number;
+  path?: string;
+}
+
+const requestContextStorage = new AsyncLocalStorage<RequestContext>();
+
+/**
+ * Generate a unique request ID
+ */
+export function generateRequestId(): string {
+  return `req_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
+}
+
+/**
+ * Run a function with request context
+ */
+export function withRequestContext<T>(context: RequestContext, fn: () => T): T {
+  return requestContextStorage.run(context, fn);
+}
+
+/**
+ * Get current request context
+ */
+export function getRequestContext(): RequestContext | undefined {
+  return requestContextStorage.getStore();
+}
+
+/**
+ * Structured log helper (for Cloud Logging)
+ */
+export function logInfo(message: string, data?: Record<string, unknown>): void {
+  const ctx = getRequestContext();
+  console.log(JSON.stringify({
+    severity: 'INFO',
+    message,
+    requestId: ctx?.requestId,
+    ...data,
+    timestamp: new Date().toISOString(),
+  }));
+}
+
+export function logWarn(message: string, data?: Record<string, unknown>): void {
+  const ctx = getRequestContext();
+  console.log(JSON.stringify({
+    severity: 'WARNING',
+    message,
+    requestId: ctx?.requestId,
+    ...data,
+    timestamp: new Date().toISOString(),
+  }));
+}
+
+export function logError(message: string, error?: unknown, data?: Record<string, unknown>): void {
+  const ctx = getRequestContext();
+  const errorInfo = error instanceof Error
+    ? { errorMessage: error.message, errorStack: error.stack }
+    : { errorMessage: String(error) };
+
+  console.error(JSON.stringify({
+    severity: 'ERROR',
+    message,
+    requestId: ctx?.requestId,
+    ...errorInfo,
+    ...data,
+    timestamp: new Date().toISOString(),
+  }));
+}
+
+/**
+ * Extract keywords from query (simple implementation)
+ */
+export function extractKeywords(query: string): string[] {
+  const stopWords = new Set([
+    'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should',
+    'may', 'might', 'must', 'shall', 'can', 'to', 'of', 'in', 'for', 'on', 'with',
+    'at', 'by', 'from', 'as', 'into', 'through', 'during', 'before', 'after',
+    'above', 'below', 'between', 'under', 'again', 'further', 'then', 'once',
+    'here', 'there', 'when', 'where', 'why', 'how', 'all', 'each', 'few', 'more',
+    'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same',
+    'so', 'than', 'too', 'very', 'just', 'and', 'but', 'if', 'or', 'because',
+    'until', 'while', 'about', 'what', 'which', 'who', 'whom', 'this', 'that',
+    'these', 'those', 'am', 'it', 'its', 'my', 'your', 'his', 'her', 'their', 'our',
+    'me', 'you', 'him', 'us', 'them', 'i', 'we', 'they', 'he', 'she'
+  ]);
+
+  return query
+    .toLowerCase()
+    .replace(/[^\w\s]/g, ' ')
+    .split(/\s+/)
+    .filter(word => word.length > 2 && !stopWords.has(word))
+    .slice(0, 10); // Limit keywords
+}
+
+/**
+ * Cosine similarity between two vectors
+ */
+export function cosineSimilarity(a: number[], b: number[]): number {
+  if (a.length !== b.length) return 0;
+  
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+  
+  for (let i = 0; i < a.length; i++) {
+    dotProduct += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  
+  const denominator = Math.sqrt(normA) * Math.sqrt(normB);
+  return denominator === 0 ? 0 : dotProduct / denominator;
+}
+
