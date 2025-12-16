@@ -49,6 +49,9 @@ export interface ChunkDoc {
   createdAt: Timestamp | FieldValue;
   embedding?: number[];
   embeddingModel?: string;
+  // Lexical indexing fields (for exact-match recall)
+  terms?: string[];          // Normalized tokens for array-contains-any queries
+  termsVersion?: number;     // Version of term extraction algorithm (for backfill)
 }
 
 /** Chunk with score for retrieval */
@@ -142,16 +145,55 @@ export interface RetrievalOptions {
   maxAgeDays?: number;
   keywords?: string[];
   useVectorSearch?: boolean;
+  // Multi-stage retrieval options
+  useQueryExpansion?: boolean;  // Enable multi-query expansion
+  requestId?: string;           // For logging correlation
 }
 
 // ============================================
-// Health Types
+// Multi-Stage Retrieval Types
 // ============================================
 
-export interface HealthResponse {
-  ok: boolean;
-  service: string;
-  project: string;
-  version?: string;
+/** Candidate counts by retrieval stage for observability */
+export interface CandidateCounts {
+  vectorK: number;
+  lexicalK: number;
+  recencyK: number;
+  mergedK: number;
+  rerankedK: number;
+  finalK: number;
 }
+
+/** Timings by retrieval stage for observability */
+export interface RetrievalTimingsStage {
+  queryParseMs: number;
+  embeddingMs: number;
+  vectorSearchMs: number;
+  lexicalSearchMs: number;
+  firestoreFetchMs: number;
+  scoringMs: number;
+  rerankMs: number;
+  totalMs: number;
+}
+
+// ============================================
+// Sources Pack - Single source of truth for sources and citations
+// ============================================
+
+/**
+ * SourcesPack represents the exact set of sources used in a chat response.
+ * This object flows through the entire pipeline ensuring:
+ * - sources: The exact chunks used as sources in the LLM prompt
+ * - citationsMap: 1:1 mapping of cid (N1, N2, ...) to Citation
+ * - The prompt source count matches citationsMap.size EXACTLY
+ */
+export interface SourcesPack {
+  /** The exact chunks used as sources - post-filtering, post-reranking */
+  sources: ScoredChunk[];
+  /** 1:1 mapping from cid (e.g., "N1") to Citation object */
+  citationsMap: Map<string, Citation>;
+  /** Number of sources = citationsMap.size = prompt source count */
+  sourceCount: number;
+}
+
 

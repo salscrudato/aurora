@@ -9,6 +9,7 @@ import {
   EMBEDDING_MODEL,
   EMBEDDING_DIMENSIONS,
   MAX_EMBEDDING_BATCH_SIZE,
+  EMBEDDING_TIMEOUT_MS,
 } from "./config";
 import { logInfo, logError, logWarn, hashText } from "./utils";
 import { getGenAIClient, isGenAIAvailable } from "./genaiClient";
@@ -89,19 +90,36 @@ async function withRetry<T>(
 }
 
 /**
- * Generate embedding for a single text with caching
+ * Create a timeout promise that rejects after specified milliseconds
+ */
+function createTimeout<T>(ms: number, context: string): Promise<T> {
+  return new Promise((_, reject) => {
+    setTimeout(() => {
+      reject(new Error(`Timeout after ${ms}ms: ${context}`));
+    }, ms);
+  });
+}
+
+/**
+ * Generate embedding for a single text with timeout and retry
  */
 async function generateSingleEmbedding(text: string): Promise<number[]> {
   const client = getGenAIClient();
 
   const result = await withRetry(async () => {
-    return await client.models.embedContent({
+    // Race between embedding call and timeout
+    const embeddingPromise = client.models.embedContent({
       model: EMBEDDING_MODEL,
       contents: text,
       config: {
         outputDimensionality: EMBEDDING_DIMENSIONS,
       },
     });
+
+    return await Promise.race([
+      embeddingPromise,
+      createTimeout<typeof embeddingPromise>(EMBEDDING_TIMEOUT_MS, 'embedding generation'),
+    ]) as Awaited<typeof embeddingPromise>;
   });
 
   if (result.embeddings && result.embeddings.length > 0 && result.embeddings[0].values) {
@@ -111,8 +129,22 @@ async function generateSingleEmbedding(text: string): Promise<number[]> {
 }
 
 /**
+ * Custom error for embedding generation failures
+ */
+export class EmbeddingError extends Error {
+  constructor(message: string, public readonly missingIndices: number[] = []) {
+    super(message);
+    this.name = 'EmbeddingError';
+  }
+}
+
+/**
  * Generate embeddings for a batch of texts with caching and retry logic
  * Uses textHash for deduplication - identical text returns cached embedding
+ *
+ * IMPORTANT: Returns an array with EXACTLY the same length as input texts.
+ * Throws EmbeddingError if any embedding fails to generate - this prevents
+ * misaligned embeddings-to-chunks assignment which would corrupt the index.
  */
 export async function generateEmbeddings(texts: string[]): Promise<number[][]> {
   if (texts.length === 0) return [];
@@ -164,6 +196,27 @@ export async function generateEmbeddings(texts: string[]): Promise<number[][]> {
     }
   }
 
+  // CRITICAL: Verify all embeddings were generated successfully
+  // If any are missing, throw an error to prevent misaligned embeddings
+  const missingIndices: number[] = [];
+  for (let i = 0; i < results.length; i++) {
+    if (results[i] === null) {
+      missingIndices.push(i);
+    }
+  }
+
+  if (missingIndices.length > 0) {
+    logError('Embedding generation incomplete - missing indices would cause misalignment', null, {
+      inputCount: texts.length,
+      missingCount: missingIndices.length,
+      missingIndices: missingIndices.slice(0, 10), // Log first 10
+    });
+    throw new EmbeddingError(
+      `Failed to generate ${missingIndices.length} of ${texts.length} embeddings`,
+      missingIndices
+    );
+  }
+
   const elapsedMs = Date.now() - startTime;
   logInfo('Embeddings generated', {
     count: texts.length,
@@ -174,7 +227,8 @@ export async function generateEmbeddings(texts: string[]): Promise<number[][]> {
     elapsedMs,
   });
 
-  return results.filter((r): r is number[] => r !== null);
+  // Safe to cast since we verified all entries are non-null above
+  return results as number[][];
 }
 
 /**

@@ -1,0 +1,254 @@
+{
+  "timestamp": "2025-12-16T12:05:47.501Z",
+  "apiUrl": "https://auroranotes-api-884985856308.us-central1.run.app",
+  "tenantId": "eval-test",
+  "summary": {
+    "passed": 16,
+    "total": 16,
+    "passRate": 100,
+    "avgLatency": 2333,
+    "p50": 2223,
+    "p90": 3793,
+    "p99": 4020,
+    "totalCitations": 68,
+    "avgCitations": 4.3
+  },
+  "byCategory": {
+    "factual": {
+      "passed": 5,
+      "total": 5
+    },
+    "decision": {
+      "passed": 3,
+      "total": 3
+    },
+    "summary": {
+      "passed": 1,
+      "total": 1
+    },
+    "list": {
+      "passed": 2,
+      "total": 2
+    },
+    "synthesis": {
+      "passed": 3,
+      "total": 3
+    },
+    "negative": {
+      "passed": 2,
+      "total": 2
+    }
+  },
+  "results": [
+    {
+      "name": "Cloud Run hosting decision",
+      "passed": true,
+      "latencyMs": 2223,
+      "citationCount": 2,
+      "keywordsFound": [
+        "cloud run",
+        "scale"
+      ],
+      "keywordsMissing": [],
+      "forbiddenFound": [],
+      "answer": "We chose Cloud Run for API hosting because it scales to zero when idle, keeping costs near zero during development [N1][N2]. The service also auto-scales up to 10 instances under load [N1][N2]."
+    },
+    {
+      "name": "Chunk size configuration",
+      "passed": true,
+      "latencyMs": 1636,
+      "citationCount": 4,
+      "keywordsFound": [
+        "450",
+        "character"
+      ],
+      "keywordsMissing": [],
+      "forbiddenFound": [],
+      "answer": "The target chunk size is 450 characters with 75 character overlap for context continuity [N3][N4]. After testing, 450 character chunks with 75 character overlap perform best [N1][N2]. The chunking strategy uses sentence-aware splitting to preserve meaning [N1][N2]. 450 character chunks had the best "
+    },
+    {
+      "name": "Embedding dimensions",
+      "passed": true,
+      "latencyMs": 1263,
+      "citationCount": 4,
+      "keywordsFound": [
+        "768"
+      ],
+      "keywordsMissing": [],
+      "forbiddenFound": [],
+      "answer": "The embeddings are 768-dimensional [N1][N2]. The Chunks collection stores embeddings as 768 floats [N7][N8]."
+    },
+    {
+      "name": "Rate limit configuration",
+      "passed": true,
+      "latencyMs": 3298,
+      "citationCount": 8,
+      "keywordsFound": [
+        "60",
+        "request",
+        "minute"
+      ],
+      "keywordsMissing": [],
+      "forbiddenFound": [],
+      "answer": "The API rate limits in production are 60 requests per minute per tenant [N1][N2]. The chat endpoint has a 30 second timeout [N1][N2]. The maximum query length is 2000 characters [N1][N2]. The rate limiting is implemented using an in-memory rate limiting with a sliding window algorithm [N1][N2]. The "
+    },
+    {
+      "name": "Sprint 1 target date",
+      "passed": true,
+      "latencyMs": 4020,
+      "citationCount": 8,
+      "keywordsFound": [
+        "january",
+        "15",
+        "2025"
+      ],
+      "keywordsMissing": [],
+      "forbiddenFound": [],
+      "answer": "The target launch date for the MVP is January 15, 2025 [N3][N4]. The MVP will include basic notes CRUD, simple search, and a chat endpoint [N3][N4]. The team consists of 2 backend devs and 1 frontend dev [N3][N4]. The budget is $500/month for cloud costs [N3][N4]. The Q1 2025 roadmap includes launch"
+    },
+    {
+      "name": "TypeScript decision",
+      "passed": true,
+      "latencyMs": 1679,
+      "citationCount": 2,
+      "keywordsFound": [
+        "typescript",
+        "type"
+      ],
+      "keywordsMissing": [],
+      "forbiddenFound": [],
+      "answer": "The backend uses TypeScript with Express.js [N1][N2]. TypeScript was chosen over Python Flask due to team familiarity and strong typing [N1][N2]."
+    },
+    {
+      "name": "Database choice",
+      "passed": true,
+      "latencyMs": 1635,
+      "citationCount": 2,
+      "keywordsFound": [
+        "firestore"
+      ],
+      "keywordsMissing": [],
+      "forbiddenFound": [],
+      "answer": "Firestore is used for persistence [N3][N4]. It is serverless and integrates seamlessly with Cloud Run [N3][N4]."
+    },
+    {
+      "name": "Pricing decision",
+      "passed": true,
+      "latencyMs": 2817,
+      "citationCount": 8,
+      "keywordsFound": [
+        "9.99",
+        "month",
+        "free"
+      ],
+      "keywordsMissing": [],
+      "forbiddenFound": [],
+      "answer": "The pricing will be $9.99/month for Pro [N1][N2], and the free tier is limited to 100 notes [N1][N2]. The target users are researchers, students, and writers [N1][N2]. The focus is on individual knowledge workers rather than enterprise [N1][N2]. The main risks include API cost overruns, user adoptio"
+    },
+    {
+      "name": "Architecture summary",
+      "passed": true,
+      "latencyMs": 1814,
+      "citationCount": 4,
+      "keywordsFound": [
+        "cloud run",
+        "firestore"
+      ],
+      "keywordsMissing": [],
+      "forbiddenFound": [],
+      "answer": "The architecture uses Cloud Run for API hosting and Firestore for persistence [N1][N2]. The backend uses TypeScript with Express.js, while the frontend uses React with Vite [N3][N4]. Key points: * Cloud Run was chosen for API hosting because it scales to zero when idle and auto-scales up to 10 insta"
+    },
+    {
+      "name": "Q1 roadmap phases",
+      "passed": true,
+      "latencyMs": 3378,
+      "citationCount": 6,
+      "keywordsFound": [
+        "phase",
+        "jan"
+      ],
+      "keywordsMissing": [],
+      "forbiddenFound": [],
+      "answer": "Here are the phases in the Q1 roadmap: * Phase 1 (Jan) - Launch MVP with core features [N1][N2]. The target launch date for the MVP is January 15, 2025 [N5][N6]. Sprint 1 goals include completing the MVP with basic notes CRUD, simple search, and a chat endpoint [N5][N6]. * Phase 2 (Feb) - Add collab"
+    },
+    {
+      "name": "Team members and tasks",
+      "passed": true,
+      "latencyMs": 3793,
+      "citationCount": 8,
+      "keywordsFound": [
+        "sarah",
+        "mike",
+        "emma"
+      ],
+      "keywordsMissing": [],
+      "forbiddenFound": [],
+      "answer": "Sarah completed authentication integration [N1][N2], Emma finished initial UI mockups [N1][N2], and Mike is blocked on Vertex AI setup and needs project permissions [N1][N2]. The team's next week focus is on end-to-end testing [N1][N2]. The team is working towards completing an MVP with basic notes "
+    },
+    {
+      "name": "RAG implementation details",
+      "passed": true,
+      "latencyMs": 1964,
+      "citationCount": 2,
+      "keywordsFound": [
+        "vector",
+        "embedding"
+      ],
+      "keywordsMissing": [],
+      "forbiddenFound": [],
+      "answer": "The retrieval system in the RAG pipeline uses hybrid search combining vector similarity (cosine) with keyword matching [N1][N2]. Embeddings are 768-dimensional using text-embedding-004 [N1][N2]. Chunks target 450 characters with 75 char overlap for context continuity [N1][N2]."
+    },
+    {
+      "name": "Competitor comparison",
+      "passed": true,
+      "latencyMs": 2963,
+      "citationCount": 8,
+      "keywordsFound": [
+        "notion",
+        "advantage"
+      ],
+      "keywordsMissing": [],
+      "forbiddenFound": [],
+      "answer": "Notion AI uses GPT-4 and costs $10/user/month [N1][N2]. Mem.ai focuses on memory graph and costs $15/month [N1][N2]. Obsidian Copilot is local-first and has a one-time cost of $50 [N1][N2]. Our advantage is simplicity and citation transparency [N1][N2]. Main risks are API cost overruns [N3][N4]. Mit"
+    },
+    {
+      "name": "Risk and mitigation",
+      "passed": true,
+      "latencyMs": 2973,
+      "citationCount": 2,
+      "keywordsFound": [
+        "risk",
+        "mitigation"
+      ],
+      "keywordsMissing": [],
+      "forbiddenFound": [],
+      "answer": "The main risks are API cost overruns, user adoption, and competition [N1][N2]. Mitigation strategies include strict rate limits, a freemium model, and focusing on simplicity as a differentiator [N1][N2]. Here's a summary of the risks and mitigations: * Main risks are API cost overruns, user adoption"
+    },
+    {
+      "name": "Unknown topic handling",
+      "passed": true,
+      "latencyMs": 926,
+      "citationCount": 0,
+      "keywordsFound": [
+        "don't have",
+        "notes"
+      ],
+      "keywordsMissing": [],
+      "forbiddenFound": [],
+      "answer": "I don't have notes about blockchain integration plans."
+    },
+    {
+      "name": "Irrelevant question",
+      "passed": true,
+      "latencyMs": 949,
+      "citationCount": 0,
+      "keywordsFound": [
+        "don't have",
+        "notes"
+      ],
+      "keywordsMissing": [],
+      "forbiddenFound": [],
+      "answer": "I don't have notes about the capital of France."
+    }
+  ]
+}

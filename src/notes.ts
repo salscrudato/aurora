@@ -74,10 +74,14 @@ export async function createNote(
   const savedData = savedDoc.data() as NoteDoc;
   
   // Enqueue for background chunk/embedding processing with backpressure
-  const enqueued = enqueueNoteProcessing(savedData);
-  if (!enqueued) {
-    logError('Failed to enqueue note for processing - queue full', null, { noteId: id });
-  }
+  // Note: enqueueNoteProcessing is async but we don't await it to avoid blocking the response
+  enqueueNoteProcessing(savedData).then(enqueued => {
+    if (!enqueued) {
+      logError('Failed to enqueue note for processing - queue full', null, { noteId: id });
+    }
+  }).catch(err => {
+    logError('Failed to enqueue note for processing', err, { noteId: id });
+  });
   
   logInfo('Note created', { 
     noteId: id, 

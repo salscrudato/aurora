@@ -1,0 +1,165 @@
+{
+  "timestamp": "2025-12-15T20:12:37.867Z",
+  "apiUrl": "https://auroranotes-api-884985856308.us-central1.run.app",
+  "summary": {
+    "passed": 8,
+    "total": 9,
+    "passRate": 89,
+    "avgLatencyMs": 2247,
+    "latencyP50Ms": 2265,
+    "latencyP90Ms": 3175,
+    "latencyP99Ms": 3175,
+    "totalCitations": 28,
+    "invalidCitations": 0,
+    "avgCitationValidityRate": 100,
+    "avgUniqueNotesPerQuery": 3.1
+  },
+  "results": [
+    {
+      "testName": "Cloud Run decision",
+      "query": "What did we decide about Cloud Run?",
+      "passed": true,
+      "latencyMs": 1917,
+      "citationCount": 1,
+      "uniqueNotesCited": 1,
+      "invalidCitations": [],
+      "topicsFound": [
+        "cloud run"
+      ],
+      "citationValidityRate": 1,
+      "topicsMissing": [
+        "scaling",
+        "docker"
+      ],
+      "forbiddenFound": [],
+      "answer": "Cloud Run was chosen for hosting the API [N1]. This was selected because it scales to zero when idle, which keeps costs low [N1]."
+    },
+    {
+      "testName": "Chunking specification",
+      "query": "What is the chunk size?",
+      "passed": true,
+      "latencyMs": 1836,
+      "citationCount": 1,
+      "uniqueNotesCited": 1,
+      "invalidCitations": [],
+      "topicsFound": [
+        "character"
+      ],
+      "citationValidityRate": 1,
+      "topicsMissing": [
+        "400",
+        "800"
+      ],
+      "forbiddenFound": [],
+      "answer": "The chunk configuration targets 450 characters, with a minimum of 80, a maximum of 700, and an overlap of 75 [N1]. Sentence-aware splitting is enabled [N1]."
+    },
+    {
+      "testName": "RAG pipeline architecture",
+      "query": "How does the retrieval work?",
+      "passed": true,
+      "latencyMs": 2555,
+      "citationCount": 3,
+      "uniqueNotesCited": 3,
+      "invalidCitations": [],
+      "topicsFound": [
+        "vector"
+      ],
+      "citationValidityRate": 1,
+      "topicsMissing": [
+        "hybrid",
+        "keyword"
+      ],
+      "forbiddenFound": [],
+      "answer": "The notes mention embedding dimensions are 768 floats per vector, approximately 3KB storage each, and indexed for similarity search [N4]. They also describe a caching strategy using an LRU cache for e"
+    },
+    {
+      "testName": "Summarization request",
+      "query": "Summarize my notes about architecture",
+      "passed": true,
+      "latencyMs": 1841,
+      "citationCount": 2,
+      "uniqueNotesCited": 2,
+      "invalidCitations": [],
+      "topicsFound": [],
+      "citationValidityRate": 1,
+      "topicsMissing": [],
+      "forbiddenFound": [],
+      "answer": "Here's a summary of the notes regarding architecture: The API architecture will use REST over GraphQL for the MVP [N1][N8]. This decision was made because REST is simpler to implement [N1], and the qu"
+    },
+    {
+      "testName": "Unknown topic handling",
+      "query": "What about quantum computing integration?",
+      "passed": false,
+      "latencyMs": 3175,
+      "citationCount": 8,
+      "uniqueNotesCited": 8,
+      "invalidCitations": [],
+      "topicsFound": [],
+      "citationValidityRate": 1,
+      "topicsMissing": [],
+      "forbiddenFound": [
+        "quantum"
+      ],
+      "answer": "The provided notes do not mention quantum computing integration. The notes do discuss a browser extension for clipping web content [N1], completing a chat endpoint [N2], structured JSON logging [N3], "
+    },
+    {
+      "testName": "Multi-note summary",
+      "query": "Give me an overview of all the technical decisions we made",
+      "passed": true,
+      "latencyMs": 2560,
+      "citationCount": 2,
+      "uniqueNotesCited": 2,
+      "invalidCitations": [],
+      "topicsFound": [],
+      "citationValidityRate": 1,
+      "topicsMissing": [],
+      "forbiddenFound": [],
+      "answer": "The notes detail two key technical decisions: the choice of TypeScript for the backend and Firestore for the database [N7][N8]. Here's a summary: * TypeScript was chosen over JavaScript for the backen"
+    },
+    {
+      "testName": "Cross-topic synthesis",
+      "query": "How do the different parts of the system work together?",
+      "passed": true,
+      "latencyMs": 1628,
+      "citationCount": 4,
+      "uniqueNotesCited": 4,
+      "invalidCitations": [],
+      "topicsFound": [],
+      "citationValidityRate": 1,
+      "topicsMissing": [],
+      "forbiddenFound": [],
+      "answer": "The notes describe the frontend, API hosting, deployment process, and error handling. The frontend uses React with Vite [N1]. The API is hosted on Cloud Run, and the frontend is hosted on Firebase Hos"
+    },
+    {
+      "testName": "Historical entity query",
+      "query": "What were all the notes ever written about deployment?",
+      "passed": true,
+      "latencyMs": 2450,
+      "citationCount": 5,
+      "uniqueNotesCited": 5,
+      "invalidCitations": [],
+      "topicsFound": [],
+      "citationValidityRate": 1,
+      "topicsMissing": [],
+      "forbiddenFound": [],
+      "answer": "The notes mention the deployment process [N1]. Merging to main triggers Cloud Build automatically [N1]. Rollback is available via Cloud Console if needed [N1]. Note size limits are a maximum of 5000 c"
+    },
+    {
+      "testName": "Synonym/paraphrase test",
+      "query": "How do we handle dividing documents into smaller pieces?",
+      "passed": true,
+      "latencyMs": 2265,
+      "citationCount": 2,
+      "uniqueNotesCited": 2,
+      "invalidCitations": [],
+      "topicsFound": [
+        "chunk",
+        "split"
+      ],
+      "citationValidityRate": 1,
+      "topicsMissing": [],
+      "forbiddenFound": [],
+      "answer": "The notes are split into chunks targeting 450 characters, with a minimum of 80 and a maximum of 700 characters, and an overlap of 75 [N2]. Sentence-aware splitting is enabled [N2]. The chat context li"
+    }
+  ]
+}

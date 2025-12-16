@@ -7,12 +7,16 @@
 import express from "express";
 import cors from "cors";
 
-import { PORT, PROJECT_ID, DEFAULT_TENANT_ID } from "./config";
+import { PORT, PROJECT_ID, DEFAULT_TENANT_ID, NOTES_COLLECTION } from "./config";
 import { createNote, listNotes } from "./notes";
 import { generateChatResponse, ConfigurationError, RateLimitError } from "./chat";
-import { logInfo, logError, generateRequestId, withRequestContext } from "./utils";
-import { ChatRequest } from "./types";
+import { logInfo, logError, logWarn, generateRequestId, withRequestContext } from "./utils";
+import { ChatRequest, NoteDoc } from "./types";
 import { rateLimitMiddleware } from "./rateLimit";
+import { processNoteChunks } from "./chunking";
+import { getDb } from "./firestore";
+import { internalAuthMiddleware, isInternalAuthConfigured } from "./internalAuth";
+import { getVertexConfigStatus, isVertexConfigured } from "./vectorIndex";
 
 // Create Express application
 const app = express();
@@ -152,9 +156,77 @@ app.post("/chat", async (req, res) => {
 });
 
 // ============================================
+// Internal Endpoints (Cloud Tasks callbacks)
+// ============================================
+
+// Validate internal auth configuration at startup
+if (!isInternalAuthConfigured()) {
+  logError('Internal auth misconfigured - see logs above', null);
+}
+
+/**
+ * POST /internal/process-note - Cloud Tasks callback for processing notes
+ *
+ * This endpoint is called by Cloud Tasks to process note chunks/embeddings.
+ * When INTERNAL_AUTH_ENABLED=true, validates OIDC token from Cloud Tasks.
+ */
+app.post("/internal/process-note", internalAuthMiddleware, async (req, res) => {
+  try {
+    const { noteId, tenantId } = req.body;
+
+    if (!noteId) {
+      return res.status(400).json({ error: "noteId is required" });
+    }
+
+    // Fetch the note from Firestore
+    const db = getDb();
+    const noteDoc = await db.collection(NOTES_COLLECTION).doc(noteId).get();
+
+    if (!noteDoc.exists) {
+      logWarn("Note not found for processing", { noteId });
+      // Return 200 to prevent Cloud Tasks from retrying
+      return res.status(200).json({ status: "not_found", noteId });
+    }
+
+    const note = noteDoc.data() as NoteDoc;
+
+    // Verify tenant if provided
+    if (tenantId && note.tenantId !== tenantId) {
+      logWarn("Tenant mismatch for note processing", { noteId, expected: tenantId, actual: note.tenantId });
+      return res.status(200).json({ status: "tenant_mismatch", noteId });
+    }
+
+    // Process the note chunks
+    await processNoteChunks(note);
+
+    logInfo("Note processed via Cloud Tasks", { noteId });
+    return res.status(200).json({ status: "processed", noteId });
+  } catch (err) {
+    logError("POST /internal/process-note error", err);
+    // Return 500 to trigger Cloud Tasks retry
+    return res.status(500).json({ error: "processing failed" });
+  }
+});
+
+// ============================================
 // Start Server
 // ============================================
 app.listen(PORT, () => {
   logInfo("auroranotes-api started", { port: PORT, project: PROJECT_ID });
   console.log(`auroranotes-api listening on http://localhost:${PORT}`);
+
+  // Log vector search configuration status at startup
+  const vertexStatus = getVertexConfigStatus();
+  if (vertexStatus.enabled && vertexStatus.configured) {
+    logInfo("Vector search: Vertex AI enabled and configured", {});
+  } else if (vertexStatus.enabled && !vertexStatus.configured) {
+    logWarn("Vector search: Vertex AI enabled but MISCONFIGURED - using Firestore fallback", {
+      errors: vertexStatus.errors,
+      hint: "Set VERTEX_INDEX_ENDPOINT_RESOURCE and VERTEX_DEPLOYED_INDEX_ID",
+    });
+  } else {
+    logInfo("Vector search: Using Firestore fallback (Vertex not enabled)", {
+      hint: "Set VERTEX_VECTOR_SEARCH_ENABLED=true for better recall",
+    });
+  }
 });

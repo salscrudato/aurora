@@ -5,7 +5,7 @@
  * Uses improved semantic boundary detection and context preservation.
  */
 
-import { FieldValue, Timestamp, WriteBatch } from "firebase-admin/firestore";
+import { Timestamp } from "firebase-admin/firestore";
 import { getDb } from "./firestore";
 import {
   CHUNKS_COLLECTION,
@@ -14,10 +14,12 @@ import {
   CHUNK_MAX_SIZE,
   CHUNK_OVERLAP,
   EMBEDDINGS_ENABLED,
+  VERTEX_VECTOR_SEARCH_ENABLED,
 } from "./config";
 import { NoteDoc, ChunkDoc } from "./types";
-import { hashText, estimateTokens, logInfo, logError } from "./utils";
-import { generateEmbeddings } from "./embeddings";
+import { hashText, estimateTokens, logInfo, logError, logWarn, extractTermsForIndexing, TERMS_VERSION } from "./utils";
+import { generateEmbeddings, EmbeddingError } from "./embeddings";
+import { getVertexIndex, VertexDatapoint } from "./vectorIndex";
 
 // Semantic boundary patterns (ordered by preference)
 const PARAGRAPH_BOUNDARY = /\n\n+/;
@@ -261,8 +263,10 @@ export async function processNoteChunks(note: NoteDoc): Promise<void> {
             const textsToEmbed = chunksMissingEmbeddings.map(c => c.text);
             const embeddings = await generateEmbeddings(textsToEmbed);
 
+            // generateEmbeddings now guarantees embeddings.length === textsToEmbed.length
+            // or throws EmbeddingError. Safe to iterate 1:1.
             const batch = db.batch();
-            for (let i = 0; i < chunksMissingEmbeddings.length && i < embeddings.length; i++) {
+            for (let i = 0; i < chunksMissingEmbeddings.length; i++) {
               const chunkRef = db.collection(CHUNKS_COLLECTION).doc(chunksMissingEmbeddings[i].chunkId);
               batch.update(chunkRef, {
                 embedding: embeddings[i],
@@ -273,11 +277,19 @@ export async function processNoteChunks(note: NoteDoc): Promise<void> {
 
             logInfo('Missing embeddings regenerated', {
               noteId: note.id,
-              embeddingsAdded: Math.min(chunksMissingEmbeddings.length, embeddings.length),
+              embeddingsAdded: chunksMissingEmbeddings.length,
               elapsedMs: Date.now() - startTime,
             });
           } catch (err) {
-            logError('Embedding regeneration failed', err, { noteId: note.id });
+            // Log embedding errors with details but continue without embeddings
+            if (err instanceof EmbeddingError) {
+              logError('Embedding regeneration failed with misalignment', err, {
+                noteId: note.id,
+                missingIndices: err.missingIndices,
+              });
+            } else {
+              logError('Embedding regeneration failed', err, { noteId: note.id });
+            }
           }
         }
         return;
@@ -308,7 +320,7 @@ export async function processNoteChunks(note: NoteDoc): Promise<void> {
       return;
     }
 
-    // Create chunk documents
+    // Create chunk documents with terms for lexical indexing
     const chunks: ChunkDoc[] = textChunks.map((text, position) => ({
       chunkId: `${note.id}_${String(position).padStart(3, '0')}`,
       noteId: note.id,
@@ -318,18 +330,31 @@ export async function processNoteChunks(note: NoteDoc): Promise<void> {
       position,
       tokenEstimate: estimateTokens(text),
       createdAt: note.createdAt,
+      // Lexical indexing fields
+      terms: extractTermsForIndexing(text),
+      termsVersion: TERMS_VERSION,
     }));
 
     // Generate embeddings if enabled
     if (EMBEDDINGS_ENABLED) {
       try {
         const embeddings = await generateEmbeddings(textChunks);
-        for (let i = 0; i < chunks.length && i < embeddings.length; i++) {
+        // generateEmbeddings now guarantees embeddings.length === textChunks.length
+        // or throws EmbeddingError. Safe to iterate 1:1.
+        for (let i = 0; i < chunks.length; i++) {
           chunks[i].embedding = embeddings[i];
           chunks[i].embeddingModel = 'text-embedding-004';
         }
       } catch (err) {
-        logError('Embedding generation failed', err, { noteId: note.id });
+        // Log embedding errors with details but continue without embeddings
+        if (err instanceof EmbeddingError) {
+          logError('Embedding generation failed with misalignment', err, {
+            noteId: note.id,
+            missingIndices: err.missingIndices,
+          });
+        } else {
+          logError('Embedding generation failed', err, { noteId: note.id });
+        }
         // Continue without embeddings - retrieval will fall back to keyword search
       }
     }
@@ -347,6 +372,9 @@ export async function processNoteChunks(note: NoteDoc): Promise<void> {
 
       await batch.commit();
     }
+
+    // Sync to Vertex AI Vector Search if enabled
+    await syncChunksToVertexIndex(chunks);
 
     const elapsedMs = Date.now() - startTime;
     logInfo('Chunks processed', {
@@ -373,5 +401,62 @@ export async function getChunksForNote(noteId: string): Promise<ChunkDoc[]> {
     .get();
 
   return snap.docs.map(d => d.data() as ChunkDoc);
+}
+
+/**
+ * Sync chunks to Vertex AI Vector Search index
+ *
+ * This is called after chunks are saved to Firestore.
+ * Only syncs chunks that have embeddings.
+ * Fails silently to avoid blocking note creation.
+ */
+async function syncChunksToVertexIndex(chunks: ChunkDoc[]): Promise<void> {
+  if (!VERTEX_VECTOR_SEARCH_ENABLED) {
+    return;
+  }
+
+  const vertexIndex = getVertexIndex();
+  if (!vertexIndex) {
+    return;
+  }
+
+  // Filter to chunks with embeddings
+  const chunksWithEmbeddings = chunks.filter(c => c.embedding && c.embedding.length > 0);
+  if (chunksWithEmbeddings.length === 0) {
+    return;
+  }
+
+  // Convert to Vertex datapoints
+  const datapoints: VertexDatapoint[] = chunksWithEmbeddings.map(chunk => ({
+    datapointId: `${chunk.chunkId}:${chunk.noteId}`,
+    featureVector: chunk.embedding!,
+    restricts: [
+      {
+        namespace: 'tenantId',
+        allowList: [chunk.tenantId],
+      },
+    ],
+  }));
+
+  try {
+    const success = await vertexIndex.upsert(datapoints);
+    if (success) {
+      logInfo('Synced chunks to Vertex index', {
+        chunkCount: datapoints.length,
+        noteId: chunks[0]?.noteId,
+      });
+    } else {
+      logWarn('Failed to sync chunks to Vertex index', {
+        chunkCount: datapoints.length,
+        noteId: chunks[0]?.noteId,
+      });
+    }
+  } catch (err) {
+    // Log but don't throw - Vertex sync is best-effort
+    logError('Vertex index sync error', err, {
+      chunkCount: datapoints.length,
+      noteId: chunks[0]?.noteId,
+    });
+  }
 }
 

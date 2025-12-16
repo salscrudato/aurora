@@ -223,18 +223,105 @@ export function extractKeywords(query: string): string[] {
  */
 export function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length !== b.length) return 0;
-  
+
   let dotProduct = 0;
   let normA = 0;
   let normB = 0;
-  
+
   for (let i = 0; i < a.length; i++) {
     dotProduct += a[i] * b[i];
     normA += a[i] * a[i];
     normB += b[i] * b[i];
   }
-  
+
   const denominator = Math.sqrt(normA) * Math.sqrt(normB);
   return denominator === 0 ? 0 : dotProduct / denominator;
+}
+
+// ============================================
+// Term Extraction for Lexical Indexing
+// ============================================
+
+// Current version of term extraction algorithm (increment when algorithm changes for backfill)
+export const TERMS_VERSION = 1;
+
+// Stop words for term extraction (more comprehensive for indexing)
+const TERM_STOP_WORDS = new Set([
+  'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+  'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should',
+  'may', 'might', 'must', 'shall', 'can', 'to', 'of', 'in', 'for', 'on', 'with',
+  'at', 'by', 'from', 'as', 'into', 'through', 'during', 'before', 'after',
+  'above', 'below', 'between', 'under', 'again', 'further', 'then', 'once',
+  'here', 'there', 'when', 'where', 'why', 'how', 'all', 'each', 'few', 'more',
+  'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same',
+  'so', 'than', 'too', 'very', 'just', 'and', 'but', 'if', 'or', 'because',
+  'until', 'while', 'about', 'what', 'which', 'who', 'whom', 'this', 'that',
+  'these', 'those', 'am', 'it', 'its', 'my', 'your', 'his', 'her', 'their', 'our',
+  'me', 'you', 'him', 'us', 'them', 'i', 'we', 'they', 'he', 'she',
+]);
+
+/**
+ * Extract normalized terms from text for lexical indexing.
+ * Returns unique, lowercase tokens suitable for Firestore array-contains-any queries.
+ *
+ * Includes:
+ * - Regular words (normalized, lowercased, stemmed minimally)
+ * - Unique identifiers (preserved with underscores/numbers)
+ * - Numbers (preserved for ID matching)
+ *
+ * Max 50 terms per chunk to stay within Firestore limits.
+ */
+export function extractTermsForIndexing(text: string): string[] {
+  const terms = new Set<string>();
+
+  // Extract unique identifiers first (e.g., CITE_TEST_002, PROJECT_ALPHA)
+  // These are high-value for exact matching
+  const uniqueIdPattern = /\b([A-Z][A-Z0-9_]{2,})\b/g;
+  let match;
+  while ((match = uniqueIdPattern.exec(text)) !== null) {
+    terms.add(match[1].toLowerCase());
+  }
+
+  // Extract regular terms
+  const normalizedText = text
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, ' ')  // Keep hyphens for compound words
+    .replace(/\s+/g, ' ');
+
+  const tokens = normalizedText.split(/\s+/);
+
+  for (const token of tokens) {
+    // Skip short terms and stop words
+    if (token.length < 2) continue;
+    if (TERM_STOP_WORDS.has(token)) continue;
+
+    // Add the term
+    terms.add(token);
+
+    // For hyphenated terms, also add components
+    if (token.includes('-')) {
+      const parts = token.split('-');
+      for (const part of parts) {
+        if (part.length >= 2 && !TERM_STOP_WORDS.has(part)) {
+          terms.add(part);
+        }
+      }
+    }
+  }
+
+  // Convert to array and limit to 50 terms (Firestore array limit considerations)
+  const termArray = Array.from(terms).slice(0, 50);
+
+  return termArray;
+}
+
+/**
+ * Check if a term looks like a unique identifier
+ */
+export function isUniqueIdentifier(term: string): boolean {
+  // Match patterns like CITE_TEST_002, PROJECT_ALPHA, TEST123
+  return /^[a-z][a-z0-9_]*[0-9_][a-z0-9_]*$/i.test(term) ||
+         /^[a-z]+_[a-z0-9_]+$/i.test(term) ||
+         /^[A-Z][A-Z0-9_]{2,}$/.test(term);
 }
 

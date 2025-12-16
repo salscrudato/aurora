@@ -2,6 +2,7 @@
  * AuroraNotes API - Chat Service
  *
  * RAG-powered chat with inline citations, retry logic, and enhanced error handling.
+ * Includes structured retrieval logging for observability.
  */
 
 import {
@@ -14,21 +15,47 @@ import {
   DEFAULT_TENANT_ID,
   MAX_CHUNKS_IN_CONTEXT,
   CITATION_RETRY_ENABLED,
+  CITATION_VERIFICATION_ENABLED,
+  CITATION_MIN_OVERLAP_SCORE,
 } from "./config";
-import { ChatRequest, ChatResponse, Citation, ScoredChunk, QueryIntent } from "./types";
+import { ChatRequest, ChatResponse, Citation, ScoredChunk, QueryIntent, SourcesPack } from "./types";
 import { retrieveRelevantChunks, analyzeQuery } from "./retrieval";
 import { logInfo, logError, logWarn, sanitizeText, isValidTenantId } from "./utils";
+import { validateCitationsWithChunks } from "./citationValidator";
+import {
+  createRetrievalLog,
+  logRetrieval,
+  RetrievalLogEntry,
+  RetrievalTimings,
+  QualityFlags,
+  CitationLogEntry,
+  computeScoreDistribution,
+  candidateCountsToStageDetails,
+} from "./retrievalLogger";
 import { getGenAIClient, isGenAIAvailable } from "./genaiClient";
 
 // Retry configuration
 const MAX_LLM_RETRIES = 2;
 const LLM_RETRY_DELAY_MS = 1000;
 
+/**
+ * Create a timeout promise that rejects after specified milliseconds
+ */
+function createTimeout<T>(ms: number, context: string): Promise<T> {
+  return new Promise((_, reject) => {
+    setTimeout(() => {
+      reject(new Error(`Timeout after ${ms}ms: ${context}`));
+    }, ms);
+  });
+}
+
 // Citation accuracy thresholds (tuned for better recall while maintaining precision)
 const MIN_CITATION_COVERAGE = 0.5;        // Trigger repair if < 50% of sources cited
 const MIN_CITATION_COVERAGE_STRICT = 0.6; // Warn if < 60% coverage after repair
-const MIN_KEYWORD_OVERLAP = 2;            // Min keyword matches for citation validity
-const MIN_CITATION_SCORE = 0.15;          // Minimum chunk score to be included as citation
+
+// NOTE: MIN_CITATION_SCORE filtering is now done in retrieval (MIN_COMBINED_SCORE)
+// to ensure prompt source count == citationsMap.size EXACTLY.
+// All chunks returned from retrieval are "source-worthy" and included in citations.
 
 /**
  * Custom error for server configuration issues (not client errors)
@@ -51,17 +78,23 @@ export class RateLimitError extends Error {
 }
 
 /**
- * Retry LLM call with exponential backoff
+ * Retry LLM call with exponential backoff and hard timeout
  */
 async function withLLMRetry<T>(
   fn: () => Promise<T>,
-  context: string
+  context: string,
+  timeoutMs: number = CHAT_TIMEOUT_MS
 ): Promise<T> {
   let lastError: Error | unknown;
 
   for (let attempt = 0; attempt <= MAX_LLM_RETRIES; attempt++) {
     try {
-      return await fn();
+      // Race between LLM call and timeout
+      const result = await Promise.race([
+        fn(),
+        createTimeout<T>(timeoutMs, context),
+      ]);
+      return result;
     } catch (err) {
       lastError = err;
       const errMessage = err instanceof Error ? err.message : String(err);
@@ -76,6 +109,11 @@ async function withLLMRetry<T>(
       // Check for rate limiting
       if (errMessage.includes('429') || errMessage.includes('RESOURCE_EXHAUSTED')) {
         throw new RateLimitError('API rate limit exceeded');
+      }
+
+      // Log timeout errors with context for debugging
+      if (errMessage.includes('Timeout')) {
+        logWarn(`${context} timeout`, { attempt: attempt + 1, timeoutMs });
       }
 
       if (attempt < MAX_LLM_RETRIES) {
@@ -121,18 +159,22 @@ function extractBestSnippet(text: string, maxLength: number = 200): string {
 }
 
 /**
- * Build citations from scored chunks with improved snippets
- * Only includes chunks that meet the minimum score threshold
+ * Build a SourcesPack from scored chunks - the single source of truth for sources/citations.
+ *
+ * IMPORTANT: No filtering here! All chunks passed in are "source-worthy"
+ * (already filtered by MIN_COMBINED_SCORE in retrieval).
+ * This ensures prompt source count == citationsMap.size EXACTLY.
+ *
+ * @param chunks - The exact chunks to use as sources (already filtered/reranked)
+ * @returns SourcesPack with 1:1 mapping between sources and citations
  */
-function buildCitations(chunks: ScoredChunk[]): Map<string, Citation> {
-  const citations = new Map<string, Citation>();
+function buildSourcesPack(chunks: ScoredChunk[]): SourcesPack {
+  const citationsMap = new Map<string, Citation>();
 
-  // Filter chunks by minimum score threshold to reduce spurious citations
-  const qualifiedChunks = chunks.filter(chunk => chunk.score >= MIN_CITATION_SCORE);
-
-  qualifiedChunks.forEach((chunk, index) => {
+  // Create 1:1 mapping - every chunk becomes a citation
+  chunks.forEach((chunk, index) => {
     const cid = `N${index + 1}`;
-    citations.set(cid, {
+    citationsMap.set(cid, {
       cid,
       noteId: chunk.noteId,
       chunkId: chunk.chunkId,
@@ -142,7 +184,11 @@ function buildCitations(chunks: ScoredChunk[]): Map<string, Citation> {
     });
   });
 
-  return citations;
+  return {
+    sources: chunks,
+    citationsMap,
+    sourceCount: chunks.length, // Equals citationsMap.size
+  };
 }
 
 /**
@@ -210,18 +256,21 @@ function getIntentInstructions(intent: QueryIntent): string {
 }
 
 /**
- * Build the RAG prompt with sources and intent-aware instructions
+ * Build the RAG prompt with sources and intent-aware instructions.
+ * Uses SourcesPack to ensure prompt source count == citationsMap.size EXACTLY.
  */
 function buildPrompt(
   query: string,
-  chunks: ScoredChunk[],
-  citations: Map<string, Citation>,
+  sourcesPack: SourcesPack,
   intent: QueryIntent = 'search'
 ): string {
+  const { sources, citationsMap, sourceCount } = sourcesPack;
+
   // Format sources with clear structure and metadata
-  const sourcesText = Array.from(citations.entries())
+  // Uses citationsMap to ensure 1:1 correspondence with prompt source count
+  const sourcesText = Array.from(citationsMap.entries())
     .map(([cid, citation]) => {
-      const chunk = chunks.find(c => c.chunkId === citation.chunkId);
+      const chunk = sources.find(c => c.chunkId === citation.chunkId);
       const text = chunk?.text || citation.snippet;
       const date = new Date(citation.createdAt).toLocaleDateString('en-US', {
         month: 'short', day: 'numeric', year: 'numeric'
@@ -231,7 +280,7 @@ function buildPrompt(
     .join('\n\n---\n\n');
 
   // Extract topics from notes for context
-  const noteTopics = extractTopicsFromChunks(chunks);
+  const noteTopics = extractTopicsFromChunks(sources);
   const topicsHint = noteTopics.length > 0
     ? `The notes contain information about: ${noteTopics.join(', ')}.`
     : '';
@@ -240,178 +289,47 @@ function buildPrompt(
   const intentInstructions = getIntentInstructions(intent);
   const intentSection = intentInstructions ? `\n${intentInstructions}` : '';
 
+  // CRITICAL: Use sourceCount (== citationsMap.size) for all source count references
+  // This ensures the LLM prompt source count matches the valid citation range exactly
   return `You are an intelligent assistant helping the user with their personal notes. Answer questions using ONLY the provided note excerpts.
 
-CITATION FORMAT (CRITICAL):
+CORE RULES:
+1. If the sources contain information relevant to the question, answer using that information with citations
+2. If the sources do NOT contain relevant information, say: "I don't have notes about [topic]"
+3. NEVER invent facts not in the sources - only state what's explicitly written
+
+CITATION FORMAT:
 • Format: [N1], [N2], [N3], etc.
-• Place IMMEDIATELY after the fact, BEFORE punctuation: "The budget is $50,000 [N1]."
+• Place citations IMMEDIATELY after each fact: "The budget is $50,000 [N1]."
 • Multiple sources for same fact: "decided on AWS [N1][N3]"
-• Different facts from different sources: "uses React [N1] and PostgreSQL [N2]"
+• Different facts from different sources: "uses React [N1] and Node [N2]"
 
 CITATION REQUIREMENTS:
 1. EVERY factual statement MUST have at least one citation
-2. If you have ${chunks.length} sources, aim to cite most of them if they're relevant
-3. NEVER make up citation IDs - only use N1 through N${chunks.length}
-4. If a source is relevant to your answer, you MUST cite it somewhere
-5. Check each source and ask: "Did I cite this?" If relevant and not cited, add it.
-
-EXAMPLE (with 3 sources):
-Bad: "The project uses React and costs $50,000." (missing citations)
-Good: "The project uses React [N1] and costs $50,000 [N2]. The timeline is 6 months [N3]."
+2. You have exactly ${sourceCount} sources - only use N1 through N${sourceCount}
+3. If a source is relevant to your answer, cite it
 
 RESPONSE GUIDELINES:
-• Answer the question directly first, then elaborate
-• Only state facts from the sources - never infer or assume
-• If sources don't fully answer, acknowledge what's missing
+• Answer the question directly, then elaborate with citations
+• Look carefully at each source for relevant information
+• Only state facts explicitly from the sources - do not make assumptions
 ${intentSection}
 
 ${topicsHint}
 
-=== USER'S NOTE EXCERPTS (${chunks.length} sources) ===
+=== USER'S NOTE EXCERPTS (${sourceCount} sources) ===
 ${sourcesText}
 === END OF NOTES ===
 
 Question: ${query}
 
-Answer using the notes above. EVERY fact must have a citation [N#]:`;
+Answer based on the notes above (every fact needs a citation [N#]):`;
 }
 
-/**
- * Parse and validate citations from response with enhanced cleaning
- */
-function validateCitations(
-  answer: string,
-  validCitations: Map<string, Citation>
-): { cleanedAnswer: string; usedCitations: Citation[]; invalidCitations: string[]; hasCitations: boolean } {
-  // Match various citation formats the LLM might produce
-  const citationPattern = /\[N(\d+)\]/g;
-  const foundCitations = answer.match(citationPattern) || [];
-
-  const usedCitationIds = new Set<string>();
-  const invalidCitations: string[] = [];
-
-  for (const match of foundCitations) {
-    const cid = match.slice(1, -1); // Remove brackets to get "N1", "N2", etc.
-    if (validCitations.has(cid)) {
-      usedCitationIds.add(cid);
-    } else {
-      invalidCitations.push(cid);
-    }
-  }
-
-  // Clean up the answer
-  let cleanedAnswer = answer;
-
-  // Remove invalid citations
-  for (const invalid of invalidCitations) {
-    cleanedAnswer = cleanedAnswer.replace(new RegExp(`\\[${invalid}\\]`, 'g'), '');
-  }
-
-  // Fix common citation formatting issues
-  cleanedAnswer = cleanedAnswer
-    // Remove duplicate adjacent citations [N1][N1] -> [N1]
-    .replace(/(\[N\d+\])(\s*\1)+/g, '$1')
-    // Clean up spaces around citations: "word [N1] ." -> "word [N1]."
-    .replace(/\s+([.!?,;:])/g, '$1')
-    // Fix multiple spaces
-    .replace(/\s+/g, ' ')
-    // Remove any leftover weird brackets
-    .replace(/\[\s*\]/g, '')
-    .trim();
-
-  // Order citations by first appearance in the answer (not numeric order)
-  // This provides better UX as citations appear in the order they're referenced
-  const citationFirstAppearance = new Map<string, number>();
-  for (const cid of usedCitationIds) {
-    const pattern = new RegExp(`\\[${cid}\\]`);
-    const match = cleanedAnswer.match(pattern);
-    if (match && match.index !== undefined) {
-      citationFirstAppearance.set(cid, match.index);
-    } else {
-      // Fallback: put at end if not found (shouldn't happen)
-      citationFirstAppearance.set(cid, Infinity);
-    }
-  }
-
-  const usedCitations = Array.from(usedCitationIds)
-    .sort((a, b) => {
-      const posA = citationFirstAppearance.get(a) ?? Infinity;
-      const posB = citationFirstAppearance.get(b) ?? Infinity;
-      return posA - posB;
-    })
-    .map(cid => validCitations.get(cid)!)
-    .filter(Boolean);
-
-  return {
-    cleanedAnswer,
-    usedCitations,
-    invalidCitations,
-    hasCitations: usedCitations.length > 0,
-  };
-}
-
-/**
- * Extract keywords from text for citation verification
- */
-function extractVerificationKeywords(text: string): Set<string> {
-  const stopWords = new Set([
-    'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-    'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as',
-    'and', 'or', 'but', 'if', 'this', 'that', 'these', 'those', 'it',
-    'based', 'notes', 'according', 'mentioned', 'stated', 'using', 'used'
-  ]);
-
-  return new Set(
-    text.toLowerCase()
-      .replace(/\[N\d+\]/g, '') // Remove citation markers
-      .replace(/[^\w\s]/g, ' ')
-      .split(/\s+/)
-      .filter(word => word.length > 2 && !stopWords.has(word))
-  );
-}
-
-/**
- * Verify that citations semantically support the claims in the answer
- * Returns citations that have sufficient keyword overlap with the answer
- */
-function verifyCitationRelevance(
-  answer: string,
-  usedCitations: Citation[],
-  chunks: ScoredChunk[]
-): { validCitations: Citation[]; suspiciousCitations: string[] } {
-  const answerKeywords = extractVerificationKeywords(answer);
-  const validCitations: Citation[] = [];
-  const suspiciousCitations: string[] = [];
-
-  for (const citation of usedCitations) {
-    // Find the full chunk text for this citation
-    const chunk = chunks.find(c => c.chunkId === citation.chunkId);
-    const sourceText = chunk?.text || citation.snippet;
-    const sourceKeywords = extractVerificationKeywords(sourceText);
-
-    // Count overlapping keywords
-    let overlapCount = 0;
-    for (const keyword of answerKeywords) {
-      if (sourceKeywords.has(keyword)) {
-        overlapCount++;
-      }
-    }
-
-    // Citation is valid if it has sufficient keyword overlap
-    if (overlapCount >= MIN_KEYWORD_OVERLAP) {
-      validCitations.push(citation);
-    } else {
-      // Still include the citation but log it as suspicious
-      validCitations.push(citation);
-      if (overlapCount === 0) {
-        suspiciousCitations.push(citation.cid);
-      }
-    }
-  }
-
-  return { validCitations, suspiciousCitations };
-}
+// NOTE: Citation validation functions (validateCitations, extractVerificationKeywords,
+// calculateOverlapScore, verifyCitationRelevance) have been consolidated into
+// src/citationValidator.ts as the single canonical validation module.
+// Use validateCitationsWithChunks() for all citation validation.
 
 /**
  * Build a repair prompt to fix missing citations
@@ -454,18 +372,26 @@ Rewrite the answer with comprehensive citations (aim to cite most or all sources
 export async function generateChatResponse(request: ChatRequest): Promise<ChatResponse> {
   const startTime = Date.now();
 
-  // Timing metrics for observability
-  const timing: {
-    retrievalMs?: number;
-    rerankMs?: number;
-    generationMs?: number;
-    repairMs?: number;
-    totalMs?: number;
-  } = {};
-
   // Sanitize and validate input
   const query = sanitizeText(request.message, CHAT_MAX_QUERY_LENGTH + 100).trim();
   const tenantId = request.tenantId || DEFAULT_TENANT_ID;
+
+  // Initialize structured retrieval log (generate requestId if not provided)
+  const retrievalLog = createRetrievalLog(tenantId, query) as RetrievalLogEntry;
+
+  // Timing metrics for observability
+  const timing: RetrievalTimings = {
+    totalMs: 0,
+  };
+
+  // Quality flags for logging
+  const qualityFlags: QualityFlags = {
+    citationCoveragePct: 0,
+    invalidCitationsRemoved: 0,
+    fallbackUsed: false,
+    insufficientEvidence: false,
+    regenerationAttempted: false,
+  };
 
   if (!query) {
     throw new Error('message is required');
@@ -484,7 +410,7 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
 
   // Retrieve relevant chunks
   const retrievalStart = Date.now();
-  let { chunks, strategy, candidateCount } = await retrieveRelevantChunks(query, {
+  let { chunks, strategy, candidateCount, candidateCounts } = await retrieveRelevantChunks(query, {
     tenantId,
     topK: RETRIEVAL_TOP_K,
     rerankTo: Math.min(RETRIEVAL_RERANK_TO, MAX_CHUNKS_IN_CONTEXT),
@@ -503,11 +429,13 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
     };
   }
 
-  // Build citations map
-  const citationsMap = buildCitations(chunks);
+  // Build SourcesPack - single source of truth for sources/citations
+  // This ensures prompt source count == citationsMap.size EXACTLY
+  const sourcesPack = buildSourcesPack(chunks);
+  const { citationsMap, sourceCount } = sourcesPack;
 
-  // Build prompt with intent-aware instructions
-  const prompt = buildPrompt(query, chunks, citationsMap, queryAnalysis.intent);
+  // Build prompt with intent-aware instructions using SourcesPack
+  const prompt = buildPrompt(query, sourcesPack, queryAnalysis.intent);
 
   // Call LLM with retry logic
   const client = getGenAIClient();
@@ -542,18 +470,30 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
     throw new Error('Failed to generate response');
   }
 
-  // Validate citations
-  let { cleanedAnswer, usedCitations, invalidCitations, hasCitations } = validateCitations(
+  // Unified citation validation pipeline using citationValidator
+  // This consolidates: invalid citation removal, formatting cleanup, overlap verification
+  const citationsList = Array.from(citationsMap.values());
+  const validationResult = validateCitationsWithChunks(
     answer,
-    citationsMap
+    citationsList,
+    chunks,
+    {
+      strictMode: true,
+      minOverlapScore: CITATION_MIN_OVERLAP_SCORE,
+      verifyRelevance: CITATION_VERIFICATION_ENABLED,
+      requestId: retrievalLog.requestId,
+    }
   );
 
-  // Log if we had to clean up invalid citations
-  if (invalidCitations.length > 0) {
-    logInfo('Cleaned invalid citations', {
-      invalidCount: invalidCitations.length,
-      invalidCitations,
-    });
+  let cleanedAnswer = validationResult.validatedAnswer;
+  let usedCitations = validationResult.validatedCitations;
+  // Use a function to check hasCitations dynamically (usedCitations may be updated by repair)
+  const checkHasCitations = () => usedCitations.length > 0;
+
+  // Track citation quality metrics
+  const totalRemovedCount = validationResult.invalidCitationsRemoved.length + validationResult.droppedCitations.length;
+  if (totalRemovedCount > 0) {
+    qualityFlags.invalidCitationsRemoved = totalRemovedCount;
   }
 
   // Detect if response looks like uncertainty about the question
@@ -564,56 +504,52 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
     cleanedAnswer.toLowerCase().includes("no notes about") ||
     cleanedAnswer.toLowerCase().includes("no information");
 
-  // Verify citation relevance - ensure citations semantically support the answer
-  if (hasCitations && usedCitations.length > 0) {
-    const { validCitations, suspiciousCitations } = verifyCitationRelevance(
-      cleanedAnswer,
-      usedCitations,
-      chunks
-    );
-
-    if (suspiciousCitations.length > 0) {
-      logWarn('Suspicious citations detected (low keyword overlap)', {
-        suspiciousCitations,
-        totalCitations: usedCitations.length,
-      });
-    }
-
-    // Keep all citations but log the verification results
-    usedCitations = validCitations;
-  }
-
-  // Calculate citation coverage - are we citing enough sources?
-  const citationCoverage = chunks.length > 0 ? usedCitations.length / chunks.length : 1;
-  const hasLowCoverage = chunks.length >= 3 && citationCoverage < MIN_CITATION_COVERAGE && !looksLikeUncertainty;
+  // Calculate citation coverage using sourceCount (== citationsMap.size)
+  // This ensures we compute coverage against the EXACT number of sources in the prompt
+  const citationCoverage = sourceCount > 0 ? usedCitations.length / sourceCount : 1;
+  const hasLowCoverage = sourceCount >= 3 && citationCoverage < MIN_CITATION_COVERAGE && !looksLikeUncertainty;
 
   // Retry if no citations found OR low citation coverage (citation repair)
-  if ((!hasCitations || hasLowCoverage) && !looksLikeUncertainty && CITATION_RETRY_ENABLED && chunks.length > 0) {
+  if ((!checkHasCitations() || hasLowCoverage) && !looksLikeUncertainty && CITATION_RETRY_ENABLED && sourceCount > 0) {
     const repairStart = Date.now();
-    const repairReason = !hasCitations ? 'no citations' : `low coverage (${Math.round(citationCoverage * 100)}%)`;
-    logInfo('Attempting citation repair', { reason: repairReason, citationCount: usedCitations.length, sourceCount: chunks.length });
+    const repairReason = !checkHasCitations() ? 'no citations' : `low coverage (${Math.round(citationCoverage * 100)}%)`;
+    qualityFlags.regenerationAttempted = true;
+    logInfo('Attempting citation repair', { reason: repairReason, citationCount: usedCitations.length, sourceCount });
 
     try {
       const repairPrompt = buildCitationRepairPrompt(answer, citationsMap);
-      const repairResult = await client.models.generateContent({
-        model: CHAT_MODEL,
-        contents: repairPrompt,
-        config: {
-          temperature: 0.1, // Low temp for repair
-          maxOutputTokens: 1024,
-        },
-      });
+      // Use shorter timeout for repair since it's a secondary operation
+      const repairResult = await withLLMRetry(async () => {
+        return await client.models.generateContent({
+          model: CHAT_MODEL,
+          contents: repairPrompt,
+          config: {
+            temperature: 0.1, // Low temp for repair
+            maxOutputTokens: 1024,
+          },
+        });
+      }, 'Citation repair', CHAT_TIMEOUT_MS / 2);
 
       const repairedAnswer = repairResult.text || '';
       if (repairedAnswer) {
-        const repaired = validateCitations(repairedAnswer, citationsMap);
-        // Accept repair if it improved citation coverage
-        const repairedCoverage = repaired.usedCitations.length / chunks.length;
-        if (repaired.hasCitations && repairedCoverage > citationCoverage) {
-          cleanedAnswer = repaired.cleanedAnswer;
-          usedCitations = repaired.usedCitations;
-          invalidCitations = repaired.invalidCitations;
-          hasCitations = true;
+        // Use unified validation for repaired answer
+        const repairedValidation = validateCitationsWithChunks(
+          repairedAnswer,
+          citationsList,
+          chunks,
+          {
+            strictMode: true,
+            minOverlapScore: CITATION_MIN_OVERLAP_SCORE,
+            verifyRelevance: CITATION_VERIFICATION_ENABLED,
+            requestId: retrievalLog.requestId,
+          }
+        );
+        const repairedHasCitations = repairedValidation.validatedCitations.length > 0;
+        // Accept repair if it improved citation coverage (using sourceCount)
+        const repairedCoverage = repairedValidation.validatedCitations.length / sourceCount;
+        if (repairedHasCitations && repairedCoverage > citationCoverage) {
+          cleanedAnswer = repairedValidation.validatedAnswer;
+          usedCitations = repairedValidation.validatedCitations;
           strategy += '_repaired';
           logInfo('Citation repair successful', {
             citationCount: usedCitations.length,
@@ -633,7 +569,9 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
   }
 
   // If still no valid citations and answer doesn't acknowledge uncertainty, provide helpful fallback
-  if (!hasCitations && !looksLikeUncertainty) {
+  if (!checkHasCitations() && !looksLikeUncertainty) {
+    qualityFlags.insufficientEvidence = true;
+    qualityFlags.fallbackUsed = true;
     logInfo('No citations found, using fallback response');
 
     // Build a helpful response mentioning what topics ARE in the notes
@@ -663,10 +601,55 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
   }
 
   timing.totalMs = Date.now() - startTime;
-  const finalCoverage = chunks.length > 0 ? Math.round((usedCitations.length / chunks.length) * 100) : 100;
+  // Use sourceCount (== citationsMap.size) for consistent coverage calculation
+  const finalCoverage = sourceCount > 0 ? Math.round((usedCitations.length / sourceCount) * 100) : 100;
 
-  // Log comprehensive metrics for observability
+  // Build citation log entries
+  const citationLogEntries: CitationLogEntry[] = usedCitations.map(c => ({
+    cid: c.cid,
+    noteId: c.noteId,
+    chunkId: c.chunkId,
+    score: c.score,
+    snippetLength: c.snippet.length,
+  }));
+
+  // Update quality flags
+  qualityFlags.citationCoveragePct = finalCoverage;
+
+  // Determine retrieval mode
+  const retrievalMode = strategy.includes('hybrid') ? 'hybrid' :
+    strategy.includes('vector') ? 'vector' :
+    strategy.includes('fallback') ? 'fallback' : 'keyword_only';
+
+  // Complete the retrieval log entry with comprehensive observability
+  const finalLog: RetrievalLogEntry = {
+    ...retrievalLog,
+    intent: queryAnalysis.intent,
+    retrievalMode: retrievalMode as 'vector' | 'hybrid' | 'keyword_only' | 'fallback',
+    candidateCounts: {
+      vectorK: candidateCounts?.vectorK || 0,
+      keywordK: candidateCounts?.lexicalK || 0,
+      mergedK: candidateCounts?.mergedK || candidateCount,
+      afterRerank: candidateCounts?.rerankedK || chunks.length,
+      finalChunks: candidateCounts?.finalK || chunks.length,
+    },
+    // Add detailed stage counts for debugging retrieval issues
+    stageDetails: candidateCounts ? candidateCountsToStageDetails(candidateCounts) : undefined,
+    // Score distribution helps identify single-source dominance or sparse results
+    scoreDistribution: computeScoreDistribution(chunks),
+    rerankMethod: strategy,
+    citations: citationLogEntries,
+    timings: timing,
+    quality: qualityFlags,
+    answerLength: cleanedAnswer.length,
+  };
+
+  // Log the structured retrieval trace
+  logRetrieval(finalLog);
+
+  // Log comprehensive metrics for observability (existing log)
   logInfo('Chat response generated', {
+    requestId: retrievalLog.requestId,
     queryLength: query.length,
     intent: queryAnalysis.intent,
     // Counts
@@ -685,12 +668,13 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
   });
 
   // Warn if coverage is below strict threshold (helps identify issues in production)
-  if (finalCoverage < MIN_CITATION_COVERAGE_STRICT * 100 && chunks.length >= 3 && !looksLikeUncertainty) {
+  if (finalCoverage < MIN_CITATION_COVERAGE_STRICT * 100 && sourceCount >= 3 && !looksLikeUncertainty) {
     logWarn('Low citation coverage detected', {
+      requestId: retrievalLog.requestId,
       coverage: `${finalCoverage}%`,
       threshold: `${MIN_CITATION_COVERAGE_STRICT * 100}%`,
       citationCount: usedCitations.length,
-      sourceCount: chunks.length,
+      sourceCount,
       query: query.slice(0, 100),
     });
   }

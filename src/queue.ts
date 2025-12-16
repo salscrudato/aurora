@@ -7,12 +7,18 @@
  * QUEUE MODES:
  *   - in-process (default): Jobs processed in-memory with backpressure
  *   - cloud-tasks (env QUEUE_MODE=cloud-tasks): Optional Cloud Tasks for durability
- *   - pubsub (env QUEUE_MODE=pubsub): Optional Pub/Sub for high volume
  */
 
 import { NoteDoc } from "./types";
 import { processNoteChunks } from "./chunking";
 import { logInfo, logError, logWarn } from "./utils";
+import {
+  QUEUE_MODE,
+  CLOUD_TASKS_QUEUE_NAME,
+  CLOUD_TASKS_LOCATION,
+  CLOUD_TASKS_SERVICE_URL,
+  PROJECT_ID,
+} from "./config";
 
 // Queue configuration
 const DEFAULT_MAX_QUEUE_SIZE = 100;
@@ -240,8 +246,78 @@ export function getBackgroundQueue(): BackgroundQueue {
   return queueInstance;
 }
 
-export function enqueueNoteProcessing(note: NoteDoc): boolean {
+/**
+ * Enqueue note for processing - uses Cloud Tasks or in-process queue based on QUEUE_MODE
+ */
+export async function enqueueNoteProcessing(note: NoteDoc): Promise<boolean> {
+  if (QUEUE_MODE === 'cloud-tasks') {
+    return enqueueToCloudTasks(note);
+  }
   return getBackgroundQueue().enqueue(note);
+}
+
+/**
+ * Enqueue note processing to Google Cloud Tasks for durable processing
+ */
+async function enqueueToCloudTasks(note: NoteDoc): Promise<boolean> {
+  if (!CLOUD_TASKS_SERVICE_URL) {
+    logError('Cloud Tasks service URL not configured', null);
+    // Fall back to in-process queue
+    return getBackgroundQueue().enqueue(note);
+  }
+
+  try {
+    // Dynamic require to handle optional @google-cloud/tasks dependency
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    let CloudTasksClient: any;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      CloudTasksClient = require('@google-cloud/tasks').CloudTasksClient;
+    } catch {
+      logError('@google-cloud/tasks not installed, falling back to in-process queue', null);
+      return getBackgroundQueue().enqueue(note);
+    }
+    const client = new CloudTasksClient();
+
+    const queuePath = client.queuePath(
+      PROJECT_ID,
+      CLOUD_TASKS_LOCATION,
+      CLOUD_TASKS_QUEUE_NAME
+    );
+
+    // Create the task payload
+    const taskPayload = {
+      noteId: note.id,
+      tenantId: note.tenantId,
+    };
+
+    const task = {
+      httpRequest: {
+        httpMethod: 'POST' as const,
+        url: `${CLOUD_TASKS_SERVICE_URL}/internal/process-note`,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: Buffer.from(JSON.stringify(taskPayload)).toString('base64'),
+      },
+    };
+
+    const [response] = await client.createTask({ parent: queuePath, task });
+
+    logInfo('Task enqueued to Cloud Tasks', {
+      noteId: note.id,
+      taskName: response.name,
+      queuePath,
+    });
+
+    return true;
+  } catch (err) {
+    logError('Failed to enqueue to Cloud Tasks, falling back to in-process', err, {
+      noteId: note.id,
+    });
+    // Fall back to in-process queue on failure
+    return getBackgroundQueue().enqueue(note);
+  }
 }
 
 export function getQueueStats() {
