@@ -448,33 +448,33 @@ function getIntentGuidance(intent: QueryIntent): { format: string; tone: string 
   switch (intent) {
     case 'summarize':
       return {
-        format: 'Start with a one-sentence overview. Follow with 2-4 bullet points for key details.',
-        tone: 'Be comprehensive yet concise.',
+        format: 'Start with a one-sentence overview, then use bullet points (•) for 2-4 key details.',
+        tone: 'Synthesize information naturally. Avoid repeating the same facts.',
       };
     case 'list':
       return {
-        format: 'Use a numbered or bulleted list. One item per line, grouped logically.',
-        tone: 'Be direct and scannable.',
+        format: 'Use bullet points (•) or numbers. One item per line. Group related items together.',
+        tone: 'Be scannable and organized.',
       };
     case 'decision':
       return {
-        format: 'Lead with the decision. Follow with the reasoning or trade-offs if mentioned.',
-        tone: 'Be clear and definitive.',
+        format: 'State the decision clearly first. Then explain the reasoning in 1-2 sentences.',
+        tone: 'Be definitive. Use "decided to" or "chose" language.',
       };
     case 'action_item':
       return {
-        format: 'List each action item clearly. Include owners, dates, or priorities if present.',
-        tone: 'Be actionable and specific.',
+        format: 'Use bullet points (•) for each action. Include who/when if mentioned in notes.',
+        tone: 'Be actionable and clear.',
       };
     case 'question':
       return {
-        format: 'Answer the question directly in the first sentence. Add context only if helpful.',
-        tone: 'Be precise and helpful.',
+        format: 'Answer directly in the first sentence. Add brief context only if it helps understanding.',
+        tone: 'Be conversational but precise.',
       };
     default:
       return {
-        format: 'Structure your response for easy reading. Use short paragraphs or bullets as appropriate.',
-        tone: 'Be clear and natural.',
+        format: 'Write 1-3 short paragraphs. Use bullet points if listing multiple related items.',
+        tone: 'Be helpful and natural.',
       };
   }
 }
@@ -485,10 +485,17 @@ const PROMPT_TEMPLATE_START = `You are a helpful assistant answering questions f
 ## Your Task
 Answer the user's question using ONLY the information in the sources below. If the sources don't contain relevant information, say "I don't have notes about that."
 
+## Response Guidelines
+1. **Be natural and conversational** - Write like you're explaining to a friend, not listing facts
+2. **Structure for readability** - Use bullet points or numbered lists when listing multiple items
+3. **Lead with the answer** - Start with the most important information first
+4. **Be concise** - Don't repeat information; synthesize related points
+
 ## How to Cite
-- Use [N1], [N2], etc. to cite sources (IDs match the sources below)
-- Place citations immediately after each fact: "The budget is $50k [N1]."
-- Cite multiple sources together if both support a fact: "using React [N1][N3]"
+- Add citations at the END of each paragraph or logical section, not after every sentence
+- Use format: [N1] or [N1][N2] for multiple sources
+- Only cite when introducing NEW information from a source
+- Example: "React Hooks let you use state in functional components. useState manages local state, while useEffect handles side effects like API calls. [N1]"
 
 ## Formatting
 `;

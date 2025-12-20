@@ -14,9 +14,21 @@ import {
   NOTES_PAGE_LIMIT,
   MAX_NOTES_PAGE_LIMIT
 } from "./config";
-import { NoteDoc, NoteResponse, NotesListResponse } from "./types";
+import { NoteDoc, NoteResponse, NotesListResponse, DeleteNoteResponse } from "./types";
 import { timestampToISO, parseCursor, encodeCursor, logInfo, logError, logWarn, sanitizeText, isValidTenantId } from "./utils";
-import { enqueueNoteProcessing } from "./queue";
+import { processNoteChunks } from "./chunking";
+import { invalidateTenantCache } from "./cache";
+import { CHUNKS_COLLECTION } from "./config";
+import { getVertexIndex } from "./vectorIndex";
+
+/**
+ * Options for creating a note
+ */
+export interface CreateNoteOptions {
+  title?: string;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+}
 
 /**
  * Convert Firestore document to API response
@@ -24,8 +36,12 @@ import { enqueueNoteProcessing } from "./queue";
 function docToResponse(doc: NoteDoc): NoteResponse {
   return {
     id: doc.id,
+    title: doc.title,
     text: doc.text,
     tenantId: doc.tenantId,
+    processingStatus: doc.processingStatus,
+    tags: doc.tags,
+    metadata: doc.metadata,
     createdAt: timestampToISO(doc.createdAt),
     updatedAt: timestampToISO(doc.updatedAt),
   };
@@ -33,10 +49,15 @@ function docToResponse(doc: NoteDoc): NoteResponse {
 
 /**
  * Create a new note with input validation and sanitization
+ *
+ * @param text - Note content (required)
+ * @param tenantId - Tenant ID (derived from authenticated user's UID)
+ * @param options - Optional title, tags, and metadata
  */
 export async function createNote(
   text: string,
-  tenantId: string = DEFAULT_TENANT_ID
+  tenantId: string = DEFAULT_TENANT_ID,
+  options: CreateNoteOptions = {}
 ): Promise<NoteResponse> {
   // Sanitize and validate input
   const sanitizedText = sanitizeText(text, MAX_NOTE_LENGTH + 100);
@@ -57,38 +78,78 @@ export async function createNote(
 
   const id = uuidv4();
   const now = FieldValue.serverTimestamp();
-  
+
+  // Build the note document
   const doc: NoteDoc = {
     id,
     text: trimmedText,
     tenantId,
+    processingStatus: 'pending',
     createdAt: now,
     updatedAt: now,
   };
 
+  // Add optional fields
+  if (options.title) {
+    doc.title = options.title.trim().slice(0, 500);
+  }
+  if (options.tags && options.tags.length > 0) {
+    doc.tags = options.tags.slice(0, 20).map(t => t.trim().slice(0, 50));
+  }
+  if (options.metadata) {
+    doc.metadata = options.metadata;
+  }
+
   const db = getDb();
   await db.collection(NOTES_COLLECTION).doc(id).set(doc);
-  
+
   // Fetch the document to get actual server timestamp
   const savedDoc = await db.collection(NOTES_COLLECTION).doc(id).get();
-  const savedData = savedDoc.data() as NoteDoc;
-  
-  // Enqueue for background chunk/embedding processing with backpressure
-  // Note: enqueueNoteProcessing is async but we don't await it to avoid blocking the response
-  enqueueNoteProcessing(savedData).then(enqueued => {
-    if (!enqueued) {
-      logError('Failed to enqueue note for processing - queue full', null, { noteId: id });
-    }
-  }).catch(err => {
-    logError('Failed to enqueue note for processing', err, { noteId: id });
+  let savedData = savedDoc.data() as NoteDoc;
+
+  // Process chunks synchronously so notes are immediately available in RAG pipeline
+  // This adds latency but ensures the note is searchable right away
+  const chunkStartTime = Date.now();
+  try {
+    await processNoteChunks(savedData);
+
+    // Update processing status to 'ready'
+    await db.collection(NOTES_COLLECTION).doc(id).update({
+      processingStatus: 'ready',
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+    savedData.processingStatus = 'ready';
+
+    logInfo('Note chunks processed synchronously', {
+      noteId: id,
+      elapsedMs: Date.now() - chunkStartTime,
+    });
+  } catch (err) {
+    // Update processing status to 'failed'
+    await db.collection(NOTES_COLLECTION).doc(id).update({
+      processingStatus: 'failed',
+      processingError: err instanceof Error ? err.message : 'Unknown error',
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+    savedData.processingStatus = 'failed';
+
+    // Log error but don't fail the note creation - the note is saved
+    // and can be re-indexed later if needed
+    logError('Chunk processing failed during note creation', err, { noteId: id });
+  }
+
+  // Invalidate retrieval cache AFTER chunks are created
+  // This ensures subsequent queries won't use stale cached results
+  invalidateTenantCache(tenantId);
+
+  logInfo('Note created', {
+    noteId: id,
+    tenantId,
+    textLength: trimmedText.length,
+    hasTitle: !!options.title,
+    tagCount: options.tags?.length || 0,
   });
-  
-  logInfo('Note created', { 
-    noteId: id, 
-    tenantId, 
-    textLength: trimmedText.length 
-  });
-  
+
   return docToResponse(savedData);
 }
 
@@ -242,12 +303,139 @@ export async function getNote(
   const doc = await db.collection(NOTES_COLLECTION).doc(noteId).get();
   
   if (!doc.exists) return null;
-  
+
   const data = doc.data() as NoteDoc;
-  
+
   // Verify tenant access
   if (data.tenantId !== tenantId) return null;
-  
+
   return docToResponse(data);
 }
 
+/**
+ * Delete a note and all associated data
+ *
+ * This operation:
+ * 1. Validates the note exists and belongs to the tenant
+ * 2. Deletes all associated chunks from Firestore
+ * 3. Removes chunk vectors from Vertex AI index (if configured)
+ * 4. Deletes the note document
+ * 5. Invalidates the tenant cache
+ *
+ * @param noteId - The ID of the note to delete
+ * @param tenantId - The tenant ID for ownership verification
+ * @returns DeleteNoteResponse on success, null if note not found or access denied
+ * @throws Error if deletion fails
+ */
+export async function deleteNote(
+  noteId: string,
+  tenantId: string = DEFAULT_TENANT_ID
+): Promise<DeleteNoteResponse | null> {
+  const db = getDb();
+  const startTime = Date.now();
+
+  // Validate inputs
+  if (!noteId || typeof noteId !== 'string') {
+    throw new Error('noteId is required');
+  }
+
+  if (!isValidTenantId(tenantId)) {
+    throw new Error('invalid tenantId format');
+  }
+
+  // Fetch the note to verify it exists and belongs to the tenant
+  const noteRef = db.collection(NOTES_COLLECTION).doc(noteId);
+  const noteDoc = await noteRef.get();
+
+  if (!noteDoc.exists) {
+    return null; // Note not found
+  }
+
+  const noteData = noteDoc.data() as NoteDoc;
+
+  // Verify tenant ownership (security check)
+  if (noteData.tenantId !== tenantId) {
+    logWarn('Delete note denied - tenant mismatch', {
+      noteId,
+      requestedTenant: tenantId,
+      actualTenant: noteData.tenantId,
+    });
+    return null; // Access denied - treat as not found for security
+  }
+
+  // Find and delete all associated chunks
+  let chunksDeleted = 0;
+  const chunkIds: string[] = [];
+
+  try {
+    // Query all chunks for this note
+    const chunksSnap = await db
+      .collection(CHUNKS_COLLECTION)
+      .where('noteId', '==', noteId)
+      .get();
+
+    if (!chunksSnap.empty) {
+      // Collect chunk IDs for Vertex removal
+      chunksSnap.docs.forEach(doc => chunkIds.push(doc.id));
+
+      // Delete chunks in batches (Firestore limit: 500 per batch)
+      const BATCH_SIZE = 400;
+      for (let i = 0; i < chunksSnap.docs.length; i += BATCH_SIZE) {
+        const batch = db.batch();
+        const batchDocs = chunksSnap.docs.slice(i, i + BATCH_SIZE);
+
+        for (const chunkDoc of batchDocs) {
+          batch.delete(chunkDoc.ref);
+        }
+
+        await batch.commit();
+        chunksDeleted += batchDocs.length;
+      }
+    }
+
+    // Remove from Vertex AI Vector Search index (if configured)
+    if (chunkIds.length > 0) {
+      const vertexIndex = getVertexIndex();
+      if (vertexIndex) {
+        try {
+          await vertexIndex.remove(chunkIds);
+          logInfo('Removed chunks from Vertex index', {
+            noteId,
+            chunkCount: chunkIds.length
+          });
+        } catch (vertexErr) {
+          // Log but don't fail - Vertex sync is best-effort
+          logError('Failed to remove chunks from Vertex index', vertexErr, {
+            noteId,
+            chunkCount: chunkIds.length
+          });
+        }
+      }
+    }
+
+    // Delete the note document
+    await noteRef.delete();
+
+    // Invalidate retrieval cache for this tenant
+    invalidateTenantCache(tenantId);
+
+    const elapsedMs = Date.now() - startTime;
+
+    logInfo('Note deleted', {
+      noteId,
+      tenantId,
+      chunksDeleted,
+      elapsedMs,
+    });
+
+    return {
+      success: true,
+      id: noteId,
+      deletedAt: new Date().toISOString(),
+      chunksDeleted,
+    };
+  } catch (err) {
+    logError('Note deletion failed', err, { noteId, tenantId });
+    throw err;
+  }
+}

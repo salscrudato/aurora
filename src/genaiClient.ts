@@ -1,21 +1,26 @@
 /**
  * AuroraNotes API - GenAI Client Factory
- * 
+ *
  * Centralized client creation for all GenAI operations (chat, embeddings, reranking).
  * Supports two authentication modes:
- * 
+ *
  *   GENAI_MODE=apikey (default):
  *     Uses GOOGLE_API_KEY or GEMINI_API_KEY environment variable
  *     Suitable for development and simple deployments
- * 
+ *
  *   GENAI_MODE=vertex:
  *     Uses Application Default Credentials (ADC) via service account
  *     Required for production Cloud Run deployments
  *     Requires GOOGLE_CLOUD_PROJECT to be set
+ *
+ * Optimizations:
+ * - Singleton pattern for connection reuse
+ * - Request concurrency limiting to prevent API throttling
+ * - Memory-efficient request tracking
  */
 
 import { GoogleGenAI } from "@google/genai";
-import { logInfo, logError } from "./utils";
+import { logInfo, logError, logWarn } from "./utils";
 
 // Singleton instances for each mode
 let apiKeyClient: GoogleGenAI | null = null;
@@ -24,6 +29,54 @@ let vertexClient: GoogleGenAI | null = null;
 // Configuration
 const GENAI_MODE = process.env.GENAI_MODE || 'apikey';
 const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
+
+// Concurrency control for API requests
+const MAX_CONCURRENT_REQUESTS = parseInt(process.env.GENAI_MAX_CONCURRENT || '10');
+let activeRequests = 0;
+const requestQueue: Array<() => void> = [];
+
+/**
+ * Acquire a request slot (for concurrency limiting)
+ * Returns a release function to call when done
+ */
+export async function acquireRequestSlot(): Promise<() => void> {
+  if (activeRequests < MAX_CONCURRENT_REQUESTS) {
+    activeRequests++;
+    return () => {
+      activeRequests--;
+      // Process next queued request if any
+      if (requestQueue.length > 0) {
+        const next = requestQueue.shift();
+        if (next) next();
+      }
+    };
+  }
+
+  // Wait for a slot to become available
+  return new Promise((resolve) => {
+    requestQueue.push(() => {
+      activeRequests++;
+      resolve(() => {
+        activeRequests--;
+        if (requestQueue.length > 0) {
+          const next = requestQueue.shift();
+          if (next) next();
+        }
+      });
+    });
+  });
+}
+
+/**
+ * Get current request stats for monitoring
+ */
+export function getRequestStats(): { active: number; queued: number; maxConcurrent: number } {
+  return {
+    active: activeRequests,
+    queued: requestQueue.length,
+    maxConcurrent: MAX_CONCURRENT_REQUESTS,
+  };
+}
 
 /**
  * Supported GenAI modes

@@ -66,9 +66,41 @@ export function timestampToISO(ts: Timestamp | Date | unknown): string {
 
 /**
  * Create a hash of text for deduplication
+ * Uses SHA-256 for cryptographic strength
  */
 export function hashText(text: string): string {
   return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16);
+}
+
+/**
+ * Fast non-cryptographic hash for cache keys (FNV-1a 32-bit)
+ * ~10x faster than SHA-256 for short strings
+ * NOT suitable for security-sensitive use cases
+ *
+ * @param text - Text to hash
+ * @returns 8-character hex string
+ */
+export function fastHash(text: string): string {
+  let hash = 2166136261; // FNV offset basis
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    // FNV prime multiplication (JavaScript handles 32-bit overflow)
+    hash = (hash * 16777619) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
+
+/**
+ * Fast hash with additional length component for better distribution
+ * Combines FNV-1a with length to reduce collisions on similar-length strings
+ *
+ * @param text - Text to hash
+ * @returns 12-character string (8 hash + 4 length)
+ */
+export function fastHashWithLength(text: string): string {
+  const hash = fastHash(text);
+  const lenComponent = (text.length & 0xFFFF).toString(16).padStart(4, '0');
+  return `${hash}${lenComponent}`;
 }
 
 /**
@@ -113,6 +145,8 @@ interface RequestContext {
   requestId: string;
   startTime: number;
   path?: string;
+  /** Request-scoped memoization cache */
+  memoCache?: Map<string, unknown>;
 }
 
 const requestContextStorage = new AsyncLocalStorage<RequestContext>();
@@ -128,7 +162,9 @@ export function generateRequestId(): string {
  * Run a function with request context
  */
 export function withRequestContext<T>(context: RequestContext, fn: () => T): T {
-  return requestContextStorage.run(context, fn);
+  // Initialize memoization cache for this request
+  const contextWithMemo = { ...context, memoCache: new Map<string, unknown>() };
+  return requestContextStorage.run(contextWithMemo, fn);
 }
 
 /**
@@ -136,6 +172,81 @@ export function withRequestContext<T>(context: RequestContext, fn: () => T): T {
  */
 export function getRequestContext(): RequestContext | undefined {
   return requestContextStorage.getStore();
+}
+
+// ============================================
+// Request-Scoped Memoization
+// ============================================
+
+/**
+ * Memoize a function result within the current request scope.
+ * Results are automatically cleared when the request completes.
+ *
+ * This is useful for avoiding duplicate work within a single request,
+ * such as repeated embedding generation or query analysis.
+ *
+ * @param key - Unique key for this memoized value
+ * @param fn - Function to compute the value if not cached
+ * @returns The cached or computed value
+ */
+export function requestMemo<T>(key: string, fn: () => T): T {
+  const ctx = getRequestContext();
+  if (!ctx?.memoCache) {
+    // No request context, just compute the value
+    return fn();
+  }
+
+  if (ctx.memoCache.has(key)) {
+    return ctx.memoCache.get(key) as T;
+  }
+
+  const value = fn();
+  ctx.memoCache.set(key, value);
+  return value;
+}
+
+/**
+ * Async version of requestMemo for async functions.
+ * Handles concurrent calls by storing the promise itself.
+ *
+ * @param key - Unique key for this memoized value
+ * @param fn - Async function to compute the value if not cached
+ * @returns Promise resolving to the cached or computed value
+ */
+export async function requestMemoAsync<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const ctx = getRequestContext();
+  if (!ctx?.memoCache) {
+    // No request context, just compute the value
+    return fn();
+  }
+
+  if (ctx.memoCache.has(key)) {
+    return ctx.memoCache.get(key) as T;
+  }
+
+  // Store the promise to handle concurrent calls
+  const promise = fn();
+  ctx.memoCache.set(key, promise);
+
+  try {
+    const value = await promise;
+    // Replace promise with resolved value for future sync access
+    ctx.memoCache.set(key, value);
+    return value;
+  } catch (err) {
+    // Remove failed promise so retry is possible
+    ctx.memoCache.delete(key);
+    throw err;
+  }
+}
+
+/**
+ * Get request memoization stats for debugging
+ */
+export function getRequestMemoStats(): { size: number } | null {
+  const ctx = getRequestContext();
+  if (!ctx?.memoCache) return null;
+  return { size: ctx.memoCache.size };
 }
 
 /**
@@ -220,22 +331,103 @@ export function extractKeywords(query: string): string[] {
 
 /**
  * Cosine similarity between two vectors
+ *
+ * Optimizations:
+ * - Loop unrolling (4x) for better CPU pipelining
+ * - Single sqrt call instead of two
+ * - Early exit for zero-length vectors
+ * - Typed array support for Float32Array embeddings
  */
-export function cosineSimilarity(a: number[], b: number[]): number {
-  if (a.length !== b.length) return 0;
+export function cosineSimilarity(a: number[] | Float32Array, b: number[] | Float32Array): number {
+  const len = a.length;
+  if (len !== b.length || len === 0) return 0;
 
   let dotProduct = 0;
   let normA = 0;
   let normB = 0;
 
-  for (let i = 0; i < a.length; i++) {
-    dotProduct += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
+  // Process 4 elements at a time (loop unrolling)
+  const unrollLimit = len - (len % 4);
+  let i = 0;
+
+  for (; i < unrollLimit; i += 4) {
+    const a0 = a[i], a1 = a[i + 1], a2 = a[i + 2], a3 = a[i + 3];
+    const b0 = b[i], b1 = b[i + 1], b2 = b[i + 2], b3 = b[i + 3];
+
+    dotProduct += a0 * b0 + a1 * b1 + a2 * b2 + a3 * b3;
+    normA += a0 * a0 + a1 * a1 + a2 * a2 + a3 * a3;
+    normB += b0 * b0 + b1 * b1 + b2 * b2 + b3 * b3;
   }
 
-  const denominator = Math.sqrt(normA) * Math.sqrt(normB);
+  // Handle remaining elements
+  for (; i < len; i++) {
+    const ai = a[i], bi = b[i];
+    dotProduct += ai * bi;
+    normA += ai * ai;
+    normB += bi * bi;
+  }
+
+  // Single sqrt call is faster than two separate calls
+  const denominator = Math.sqrt(normA * normB);
   return denominator === 0 ? 0 : dotProduct / denominator;
+}
+
+/**
+ * Batch cosine similarity: compute similarity of one query against many candidates
+ * More efficient than calling cosineSimilarity repeatedly
+ */
+export function batchCosineSimilarity(
+  query: number[] | Float32Array,
+  candidates: Array<number[] | Float32Array>
+): number[] {
+  const len = query.length;
+  if (len === 0 || candidates.length === 0) return [];
+
+  // Pre-compute query norm
+  let queryNorm = 0;
+  for (let i = 0; i < len; i++) {
+    queryNorm += query[i] * query[i];
+  }
+  queryNorm = Math.sqrt(queryNorm);
+
+  if (queryNorm === 0) {
+    return new Array(candidates.length).fill(0);
+  }
+
+  const results: number[] = new Array(candidates.length);
+
+  for (let c = 0; c < candidates.length; c++) {
+    const candidate = candidates[c];
+    if (candidate.length !== len) {
+      results[c] = 0;
+      continue;
+    }
+
+    let dotProduct = 0;
+    let candidateNorm = 0;
+
+    // Unrolled loop
+    const unrollLimit = len - (len % 4);
+    let i = 0;
+
+    for (; i < unrollLimit; i += 4) {
+      const q0 = query[i], q1 = query[i + 1], q2 = query[i + 2], q3 = query[i + 3];
+      const c0 = candidate[i], c1 = candidate[i + 1], c2 = candidate[i + 2], c3 = candidate[i + 3];
+
+      dotProduct += q0 * c0 + q1 * c1 + q2 * c2 + q3 * c3;
+      candidateNorm += c0 * c0 + c1 * c1 + c2 * c2 + c3 * c3;
+    }
+
+    for (; i < len; i++) {
+      dotProduct += query[i] * candidate[i];
+      candidateNorm += candidate[i] * candidate[i];
+    }
+
+    const denominator = queryNorm * Math.sqrt(candidateNorm);
+    results[c] = denominator === 0 ? 0 : dotProduct / denominator;
+  }
+
+  return results;
 }
 
 // ============================================

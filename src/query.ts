@@ -1,12 +1,15 @@
 /**
  * AuroraNotes API - Query Understanding Module
- * 
+ *
  * Analyzes user queries to extract intent, time hints, keywords, and entities.
  * Improves retrieval quality by understanding what the user is looking for.
+ *
+ * Optimizations:
+ * - Request-scoped memoization to avoid re-analyzing the same query
  */
 
 import { QueryAnalysis, QueryIntent } from "./types";
-import { extractKeywords } from "./utils";
+import { extractKeywords, requestMemo } from "./utils";
 
 // Intent detection patterns - ordered by specificity (most specific first)
 const INTENT_PATTERNS: { pattern: RegExp; intent: QueryIntent }[] = [
@@ -176,16 +179,16 @@ function generateBoostTerms(keywords: string[], intent: QueryIntent): string[] {
 }
 
 /**
- * Main query analysis function
+ * Internal query analysis implementation
  */
-export function analyzeQuery(query: string): QueryAnalysis {
+function analyzeQueryInternal(query: string): QueryAnalysis {
   const normalizedQuery = normalizeQuery(query);
   const intent = detectIntent(normalizedQuery);
   const keywords = extractKeywords(normalizedQuery);
   const timeHint = extractTimeHint(normalizedQuery);
   const entities = extractEntities(query); // Use original for entity extraction
   const boostTerms = generateBoostTerms(keywords, intent);
-  
+
   return {
     originalQuery: query,
     normalizedQuery,
@@ -195,5 +198,13 @@ export function analyzeQuery(query: string): QueryAnalysis {
     entities: entities.length > 0 ? entities : undefined,
     boostTerms: boostTerms.length > keywords.length ? boostTerms : undefined,
   };
+}
+
+/**
+ * Main query analysis function with request-scoped memoization.
+ * Avoids re-analyzing the same query multiple times within a single request.
+ */
+export function analyzeQuery(query: string): QueryAnalysis {
+  return requestMemo(`query_analysis:${query}`, () => analyzeQueryInternal(query));
 }
 

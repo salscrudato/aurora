@@ -24,8 +24,9 @@ export interface RetrievalTimings {
   contextAssemblyMs?: number;
   generationMs?: number;
   validationMs?: number;
-  repairMs?: number;      // Time spent on citation repair
-  retrievalMs?: number;   // Total retrieval time
+  repairMs?: number;         // Time spent on citation repair
+  retrievalMs?: number;      // Total retrieval time
+  postProcessMs?: number;    // Time spent on enhanced post-processing
   totalMs: number;
 }
 
@@ -50,6 +51,9 @@ export interface QualityFlags {
   diversityScore?: number;
   queryExpanded?: boolean;  // Whether query expansion was used
   mmrApplied?: boolean;     // Whether MMR reranking was applied
+  danglingRefsRemoved?: number; // Number of dangling [N#] references removed
+  potentialHallucinations?: boolean; // Whether potential hallucinations were detected
+  contradictionsDetected?: boolean;  // Whether contradictions were detected in response
 }
 
 /**
@@ -62,6 +66,17 @@ export interface ScoreDistribution {
   scoreGap: number;        // Gap between top and second score
   uniqueNoteCount: number;
   scoreStdDev: number;
+}
+
+/** Citation validation statistics for observability */
+export interface CitationValidationStats {
+  totalCitationsInAnswer: number;
+  validCitations: number;
+  invalidCitationsRemoved: number;
+  weakCitations: number;
+  contractCompliant: boolean;
+  overallConfidence: number;
+  citationAccuracy: number;
 }
 
 export interface RetrievalLogEntry {
@@ -94,6 +109,12 @@ export interface RetrievalLogEntry {
   quality: QualityFlags;
   answerLength: number;
   timestamp: string;
+
+  // New observability fields for Phase 5
+  totalSourcesReturned?: number;          // Total sources sent to client
+  llmContextBudgetChars?: number;         // Context budget used for this request
+  citationValidation?: CitationValidationStats;  // Detailed validation stats
+  pipelineProcessingMs?: number;          // Time spent in validation pipeline
 }
 
 /**

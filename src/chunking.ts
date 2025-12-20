@@ -14,6 +14,7 @@ import {
   CHUNK_MAX_SIZE,
   CHUNK_OVERLAP,
   EMBEDDINGS_ENABLED,
+  EMBEDDING_MODEL,
   VERTEX_VECTOR_SEARCH_ENABLED,
 } from "./config";
 import { NoteDoc, ChunkDoc } from "./types";
@@ -21,11 +22,8 @@ import { hashText, estimateTokens, logInfo, logError, logWarn, extractTermsForIn
 import { generateEmbeddings, EmbeddingError } from "./embeddings";
 import { getVertexIndex, VertexDatapoint } from "./vectorIndex";
 
-// Semantic boundary patterns (ordered by preference)
+// Semantic boundary pattern for splitting paragraphs
 const PARAGRAPH_BOUNDARY = /\n\n+/;
-const SENTENCE_BOUNDARY = /(?<=[.!?])\s+(?=[A-Z])/;
-const LIST_BOUNDARY = /\n(?=[-*•]|\d+\.)/;
-const COLON_BOUNDARY = /:\s*\n/;
 
 /**
  * Split text into semantic units (paragraphs, then sentences)
@@ -56,9 +54,14 @@ function splitIntoSemanticUnits(text: string): string[] {
 export function splitIntoChunks(text: string): string[] {
   const normalizedText = text.replace(/\r\n/g, '\n').trim();
 
-  // Short text: return as single chunk if it meets minimum size
+  // Empty text: return nothing
+  if (!normalizedText) {
+    return [];
+  }
+
+  // Short text: return as single chunk (always index short notes for retrieval)
   if (normalizedText.length <= CHUNK_MAX_SIZE) {
-    return normalizedText.length >= CHUNK_MIN_SIZE ? [normalizedText] : [];
+    return [normalizedText];
   }
 
   const units = splitIntoSemanticUnits(normalizedText);
@@ -270,7 +273,7 @@ export async function processNoteChunks(note: NoteDoc): Promise<void> {
               const chunkRef = db.collection(CHUNKS_COLLECTION).doc(chunksMissingEmbeddings[i].chunkId);
               batch.update(chunkRef, {
                 embedding: embeddings[i],
-                embeddingModel: 'text-embedding-004',
+                embeddingModel: EMBEDDING_MODEL,
               });
             }
             await batch.commit();
@@ -302,7 +305,10 @@ export async function processNoteChunks(note: NoteDoc): Promise<void> {
       hadExistingChunks: existingChunks.length > 0,
     });
 
-    // Delete existing chunks by fetching fresh references
+    // Compute old Vertex datapoint IDs for cleanup BEFORE deleting Firestore chunks
+    const oldDatapointIds = existingChunks.map(chunk => `${chunk.chunkId}:${chunk.noteId}`);
+
+    // Delete existing chunks from Firestore
     if (existingChunks.length > 0) {
       const deleteBatch = db.batch();
       for (const chunk of existingChunks) {
@@ -310,6 +316,17 @@ export async function processNoteChunks(note: NoteDoc): Promise<void> {
         deleteBatch.delete(docRef);
       }
       await deleteBatch.commit();
+    }
+
+    // Remove stale datapoints from Vertex index (best-effort, non-blocking)
+    if (oldDatapointIds.length > 0 && VERTEX_VECTOR_SEARCH_ENABLED) {
+      removeStaleVertexDatapoints(oldDatapointIds, note.id).catch(err => {
+        logWarn('Failed to remove stale Vertex datapoints', {
+          noteId: note.id,
+          datapointCount: oldDatapointIds.length,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
     }
 
     // Split note into chunks
@@ -320,20 +337,38 @@ export async function processNoteChunks(note: NoteDoc): Promise<void> {
       return;
     }
 
-    // Create chunk documents with terms for lexical indexing
-    const chunks: ChunkDoc[] = textChunks.map((text, position) => ({
-      chunkId: `${note.id}_${String(position).padStart(3, '0')}`,
-      noteId: note.id,
-      tenantId: note.tenantId,
-      text,
-      textHash: hashText(text),
-      position,
-      tokenEstimate: estimateTokens(text),
-      createdAt: note.createdAt,
-      // Lexical indexing fields
-      terms: extractTermsForIndexing(text),
-      termsVersion: TERMS_VERSION,
-    }));
+    // Create chunk documents with terms for lexical indexing and context windows
+    const CONTEXT_WINDOW_SIZE = 100; // chars of context from prev/next chunk
+    const chunks: ChunkDoc[] = textChunks.map((text, position) => {
+      // Extract context from adjacent chunks for citation accuracy
+      const prevContext = position > 0
+        ? textChunks[position - 1].slice(-CONTEXT_WINDOW_SIZE)
+        : null;  // Use null instead of undefined for Firestore compatibility
+      const nextContext = position < textChunks.length - 1
+        ? textChunks[position + 1].slice(0, CONTEXT_WINDOW_SIZE)
+        : null;  // Use null instead of undefined for Firestore compatibility
+
+      const chunk: ChunkDoc = {
+        chunkId: `${note.id}_${String(position).padStart(3, '0')}`,
+        noteId: note.id,
+        tenantId: note.tenantId,
+        text,
+        textHash: hashText(text),
+        position,
+        tokenEstimate: estimateTokens(text),
+        createdAt: note.createdAt,
+        // Lexical indexing fields
+        terms: extractTermsForIndexing(text),
+        termsVersion: TERMS_VERSION,
+        totalChunks: textChunks.length,
+      };
+
+      // Only add context fields if they have values (Firestore doesn't accept undefined)
+      if (prevContext) chunk.prevContext = prevContext;
+      if (nextContext) chunk.nextContext = nextContext;
+
+      return chunk;
+    });
 
     // Generate embeddings if enabled
     if (EMBEDDINGS_ENABLED) {
@@ -343,7 +378,7 @@ export async function processNoteChunks(note: NoteDoc): Promise<void> {
         // or throws EmbeddingError. Safe to iterate 1:1.
         for (let i = 0; i < chunks.length; i++) {
           chunks[i].embedding = embeddings[i];
-          chunks[i].embeddingModel = 'text-embedding-004';
+          chunks[i].embeddingModel = EMBEDDING_MODEL;
         }
       } catch (err) {
         // Log embedding errors with details but continue without embeddings
@@ -401,6 +436,48 @@ export async function getChunksForNote(noteId: string): Promise<ChunkDoc[]> {
     .get();
 
   return snap.docs.map(d => d.data() as ChunkDoc);
+}
+
+/**
+ * Remove stale datapoints from Vertex index when chunks are replaced.
+ * This prevents orphan datapoints from accumulating and degrading retrieval quality.
+ *
+ * Called during note reprocessing when old chunks are being deleted.
+ * Non-blocking: logs errors but doesn't throw.
+ */
+async function removeStaleVertexDatapoints(datapointIds: string[], noteId: string): Promise<void> {
+  if (datapointIds.length === 0) {
+    return;
+  }
+
+  const vertexIndex = getVertexIndex();
+  if (!vertexIndex) {
+    return;
+  }
+
+  const startTime = Date.now();
+
+  try {
+    const success = await vertexIndex.remove(datapointIds);
+    if (success) {
+      logInfo('Removed stale Vertex datapoints', {
+        noteId,
+        datapointCount: datapointIds.length,
+        elapsedMs: Date.now() - startTime,
+      });
+    } else {
+      logWarn('Failed to remove stale Vertex datapoints', {
+        noteId,
+        datapointCount: datapointIds.length,
+      });
+    }
+  } catch (err) {
+    // Log but don't throw - stale cleanup is best-effort
+    logError('Error removing stale Vertex datapoints', err, {
+      noteId,
+      datapointCount: datapointIds.length,
+    });
+  }
 }
 
 /**

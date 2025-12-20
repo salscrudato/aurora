@@ -77,14 +77,14 @@ export function getOrderedUniqueCitations(answer: string): string[] {
 }
 
 /**
- * Remove invalid citation tokens from answer text
+ * Remove invalid citation tokens from answer text while preserving formatting
  */
 export function removeInvalidCitations(
   answer: string,
   validCids: Set<string>
 ): { cleaned: string; removed: string[] } {
   const removed: string[] = [];
-  
+
   const cleaned = answer.replace(/\[N(\d+)\]/g, (match, num) => {
     const cid = `N${num}`;
     if (validCids.has(cid)) {
@@ -94,8 +94,15 @@ export function removeInvalidCitations(
       return ''; // Remove invalid citation
     }
   });
-  
-  return { cleaned: cleaned.replace(/\s+/g, ' ').trim(), removed };
+
+  // Clean up extra spaces/tabs without destroying newlines
+  const normalized = cleaned
+    .replace(/[ \t]+/g, ' ')         // Collapse multiple spaces/tabs to single space
+    .replace(/\n{3,}/g, '\n\n')      // Normalize multiple newlines to double
+    .replace(/[ \t]+$/gm, '')        // Trim trailing whitespace from each line
+    .trim();
+
+  return { cleaned: normalized, removed };
 }
 
 /**
@@ -117,7 +124,7 @@ export function calculateCitationCoverage(answer: string): number {
 }
 
 /**
- * Clean up citation formatting issues in answer
+ * Clean up citation formatting issues in answer while preserving newlines
  */
 export function cleanCitationFormatting(answer: string): string {
   return answer
@@ -125,8 +132,12 @@ export function cleanCitationFormatting(answer: string): string {
     .replace(/(\[N\d+\])(\s*\1)+/g, '$1')
     // Clean up spaces around citations: "word [N1] ." -> "word [N1]."
     .replace(/\s+([.!?,;:])/g, '$1')
-    // Fix multiple spaces
-    .replace(/\s+/g, ' ')
+    // Collapse multiple spaces/tabs on same line (preserve newlines)
+    .replace(/[ \t]+/g, ' ')
+    // Normalize multiple consecutive newlines to double newline (paragraph break)
+    .replace(/\n{3,}/g, '\n\n')
+    // Trim trailing whitespace from each line
+    .replace(/[ \t]+$/gm, '')
     // Remove any leftover empty brackets
     .replace(/\[\s*\]/g, '')
     .trim();

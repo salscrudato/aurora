@@ -12,11 +12,10 @@
 
 import { getGenAIClient, isGenAIAvailable } from "./genaiClient";
 import { logInfo, logError, logWarn } from "./utils";
-import { QUERY_EXPANSION_ENABLED, QUERY_EXPANSION_REWRITES } from "./config";
+import { QUERY_EXPANSION_ENABLED, QUERY_EXPANSION_REWRITES, QUERY_EXPANSION_TTL_MS, QUERY_EXPANSION_MODEL } from "./config";
 
 // Cache for expanded queries to avoid repeated LLM calls
 const expansionCache = new Map<string, { variants: string[]; timestamp: number }>();
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const MAX_CACHE_SIZE = 100;
 
 // Expansion prompt template
@@ -56,7 +55,7 @@ function getCacheKey(query: string): string {
 function evictOldCacheEntries(): void {
   const now = Date.now();
   for (const [key, value] of expansionCache.entries()) {
-    if (now - value.timestamp > CACHE_TTL_MS) {
+    if (now - value.timestamp > QUERY_EXPANSION_TTL_MS) {
       expansionCache.delete(key);
     }
   }
@@ -87,7 +86,7 @@ export async function expandQuery(query: string): Promise<string[]> {
   
   // Check cache
   const cached = expansionCache.get(cacheKey);
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+  if (cached && Date.now() - cached.timestamp < QUERY_EXPANSION_TTL_MS) {
     logInfo('Query expansion cache hit', { query: query.slice(0, 50) });
     return cached.variants;
   }
@@ -99,7 +98,7 @@ export async function expandQuery(query: string): Promise<string[]> {
     const prompt = EXPANSION_PROMPT.replace('{query}', query);
 
     const response = await client.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: QUERY_EXPANSION_MODEL,
       contents: prompt,
       config: {
         temperature: 0.7, // Some creativity for variations
@@ -134,39 +133,5 @@ export async function expandQuery(query: string): Promise<string[]> {
     logError('Query expansion failed', err);
     return [query]; // Fallback to original query
   }
-}
-
-/**
- * Generate embeddings for all query variants
- * Returns a combined embedding (average of all variants)
- */
-export async function generateExpandedEmbedding(
-  query: string,
-  generateEmbedding: (text: string) => Promise<number[]>
-): Promise<{ embedding: number[]; variants: string[] }> {
-  const variants = await expandQuery(query);
-  
-  if (variants.length === 1) {
-    // No expansion, just use original
-    const embedding = await generateEmbedding(query);
-    return { embedding, variants };
-  }
-
-  // Generate embeddings for all variants in parallel
-  const embeddings = await Promise.all(
-    variants.map(v => generateEmbedding(v))
-  );
-
-  // Average the embeddings
-  const dim = embeddings[0].length;
-  const avgEmbedding = new Array(dim).fill(0);
-  
-  for (const emb of embeddings) {
-    for (let i = 0; i < dim; i++) {
-      avgEmbedding[i] += emb[i] / embeddings.length;
-    }
-  }
-
-  return { embedding: avgEmbedding, variants };
 }
 

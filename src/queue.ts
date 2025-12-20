@@ -18,6 +18,9 @@ import {
   CLOUD_TASKS_LOCATION,
   CLOUD_TASKS_SERVICE_URL,
   PROJECT_ID,
+  INTERNAL_AUTH_ENABLED,
+  INTERNAL_AUTH_AUDIENCE,
+  CLOUD_TASKS_OIDC_SERVICE_ACCOUNT,
 } from "./config";
 
 // Queue configuration
@@ -266,6 +269,16 @@ async function enqueueToCloudTasks(note: NoteDoc): Promise<boolean> {
     return getBackgroundQueue().enqueue(note);
   }
 
+  // Check for OIDC configuration when internal auth is enabled
+  if (INTERNAL_AUTH_ENABLED && !CLOUD_TASKS_OIDC_SERVICE_ACCOUNT) {
+    logError('Cloud Tasks OIDC misconfiguration: INTERNAL_AUTH_ENABLED=true but no service account configured', null, {
+      noteId: note.id,
+      hint: 'Set CLOUD_TASKS_OIDC_SERVICE_ACCOUNT or INTERNAL_AUTH_SERVICE_ACCOUNT to the service account email used by Cloud Tasks',
+    });
+    // Fall back to in-process queue
+    return getBackgroundQueue().enqueue(note);
+  }
+
   try {
     // Dynamic require to handle optional @google-cloud/tasks dependency
     // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -291,16 +304,35 @@ async function enqueueToCloudTasks(note: NoteDoc): Promise<boolean> {
       tenantId: note.tenantId,
     };
 
-    const task = {
-      httpRequest: {
-        httpMethod: 'POST' as const,
-        url: `${CLOUD_TASKS_SERVICE_URL}/internal/process-note`,
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: Buffer.from(JSON.stringify(taskPayload)).toString('base64'),
+    // Build the HTTP request
+    const httpRequest: {
+      httpMethod: 'POST';
+      url: string;
+      headers: Record<string, string>;
+      body: string;
+      oidcToken?: { serviceAccountEmail: string; audience: string };
+    } = {
+      httpMethod: 'POST' as const,
+      url: `${CLOUD_TASKS_SERVICE_URL}/internal/process-note`,
+      headers: {
+        'Content-Type': 'application/json',
       },
+      body: Buffer.from(JSON.stringify(taskPayload)).toString('base64'),
     };
+
+    // Add OIDC token when internal auth is enabled
+    if (INTERNAL_AUTH_ENABLED && CLOUD_TASKS_OIDC_SERVICE_ACCOUNT) {
+      httpRequest.oidcToken = {
+        serviceAccountEmail: CLOUD_TASKS_OIDC_SERVICE_ACCOUNT,
+        audience: INTERNAL_AUTH_AUDIENCE || CLOUD_TASKS_SERVICE_URL,
+      };
+      logInfo('Cloud Tasks OIDC token configured', {
+        serviceAccount: CLOUD_TASKS_OIDC_SERVICE_ACCOUNT,
+        audience: INTERNAL_AUTH_AUDIENCE || CLOUD_TASKS_SERVICE_URL,
+      });
+    }
+
+    const task = { httpRequest };
 
     const [response] = await client.createTask({ parent: queuePath, task });
 
@@ -308,6 +340,7 @@ async function enqueueToCloudTasks(note: NoteDoc): Promise<boolean> {
       noteId: note.id,
       taskName: response.name,
       queuePath,
+      hasOidcToken: !!httpRequest.oidcToken,
     });
 
     return true;

@@ -168,6 +168,79 @@ export class FirestoreApproxVectorIndex implements VectorIndex {
 // Static flag to track if misconfiguration warning has been logged
 let vertexMisconfigWarningLogged = false;
 
+// ============================================
+// Auth Client Connection Pool
+// ============================================
+// Caches GoogleAuth client and access tokens to avoid re-authentication overhead
+// Access tokens are cached with automatic refresh before expiration
+
+interface CachedAuthToken {
+  token: string;
+  expiresAt: number;  // Unix timestamp in ms
+}
+
+let cachedAuthClient: InstanceType<typeof import('google-auth-library').GoogleAuth> | null = null;
+let cachedAccessToken: CachedAuthToken | null = null;
+const TOKEN_REFRESH_BUFFER_MS = 60 * 1000;  // Refresh 60 seconds before expiration
+const TOKEN_DEFAULT_TTL_MS = 50 * 60 * 1000;  // Default 50 min if no expiry provided (tokens typically last 1 hour)
+
+/**
+ * Get or create the GoogleAuth client (singleton)
+ * This avoids re-creating the auth client on every request
+ */
+async function getAuthClient(): Promise<InstanceType<typeof import('google-auth-library').GoogleAuth>> {
+  if (cachedAuthClient) {
+    return cachedAuthClient;
+  }
+
+  const { GoogleAuth } = await import('google-auth-library');
+  cachedAuthClient = new GoogleAuth({
+    scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+  });
+
+  return cachedAuthClient;
+}
+
+/**
+ * Get a valid access token, using cache when possible
+ * Automatically refreshes token before expiration
+ */
+async function getAccessToken(): Promise<string> {
+  const now = Date.now();
+
+  // Return cached token if still valid (with buffer for safety)
+  if (cachedAccessToken && cachedAccessToken.expiresAt > now + TOKEN_REFRESH_BUFFER_MS) {
+    return cachedAccessToken.token;
+  }
+
+  // Get fresh token
+  const auth = await getAuthClient();
+  const client = await auth.getClient();
+  const tokenResponse = await client.getAccessToken();
+
+  if (!tokenResponse.token) {
+    throw new Error('Failed to get access token');
+  }
+
+  // Cache the token with expiration
+  // Use provided expiry or default TTL
+  const expiresAt = tokenResponse.res?.data?.expiry_date || (now + TOKEN_DEFAULT_TTL_MS);
+  cachedAccessToken = {
+    token: tokenResponse.token,
+    expiresAt: typeof expiresAt === 'number' ? expiresAt : now + TOKEN_DEFAULT_TTL_MS,
+  };
+
+  return cachedAccessToken.token;
+}
+
+/**
+ * Clear cached auth (for testing or credential rotation)
+ */
+export function clearVertexAuthCache(): void {
+  cachedAuthClient = null;
+  cachedAccessToken = null;
+}
+
 /**
  * Parsed Vertex configuration with validated fields
  */
@@ -401,17 +474,8 @@ export class VertexVectorSearchIndex implements VectorIndex {
     const startTime = Date.now();
 
     try {
-      // Get access token for authentication
-      const { GoogleAuth } = await import('google-auth-library');
-      const auth = new GoogleAuth({
-        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-      });
-      const client = await auth.getClient();
-      const accessToken = await client.getAccessToken();
-
-      if (!accessToken.token) {
-        throw new Error('Failed to get access token');
-      }
+      // Get access token using cached auth client (avoids re-authentication overhead)
+      const accessToken = await getAccessToken();
 
       // Build the findNeighbors request
       const requestBody = {
@@ -437,7 +501,7 @@ export class VertexVectorSearchIndex implements VectorIndex {
       const response = await fetch(this.config.findNeighborsUrl, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${accessToken.token}`,
+          'Authorization': `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(requestBody),
@@ -500,16 +564,8 @@ export class VertexVectorSearchIndex implements VectorIndex {
     const startTime = Date.now();
 
     try {
-      const { GoogleAuth } = await import('google-auth-library');
-      const auth = new GoogleAuth({
-        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-      });
-      const client = await auth.getClient();
-      const accessToken = await client.getAccessToken();
-
-      if (!accessToken.token) {
-        throw new Error('Failed to get access token');
-      }
+      // Get access token using cached auth client (avoids re-authentication overhead)
+      const accessToken = await getAccessToken();
 
       const requestBody = {
         datapoints: datapoints.map(dp => ({
@@ -522,7 +578,7 @@ export class VertexVectorSearchIndex implements VectorIndex {
       const response = await fetch(this.config.upsertUrl, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${accessToken.token}`,
+          'Authorization': `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(requestBody),
@@ -557,16 +613,8 @@ export class VertexVectorSearchIndex implements VectorIndex {
     }
 
     try {
-      const { GoogleAuth } = await import('google-auth-library');
-      const auth = new GoogleAuth({
-        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-      });
-      const client = await auth.getClient();
-      const accessToken = await client.getAccessToken();
-
-      if (!accessToken.token) {
-        throw new Error('Failed to get access token');
-      }
+      // Get access token using cached auth client (avoids re-authentication overhead)
+      const accessToken = await getAccessToken();
 
       const requestBody = {
         datapointIds,
@@ -575,7 +623,7 @@ export class VertexVectorSearchIndex implements VectorIndex {
       const response = await fetch(this.config.removeUrl, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${accessToken.token}`,
+          'Authorization': `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(requestBody),
