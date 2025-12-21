@@ -15,7 +15,7 @@ import helmet from "helmet";
 import compression from "compression";
 
 import { PORT, PROJECT_ID, DEFAULT_TENANT_ID, NOTES_COLLECTION } from "./config";
-import { createNote, listNotes, deleteNote } from "./notes";
+import { createNote, listNotes, updateNote, deleteNote } from "./notes";
 import { generateChatResponse, ConfigurationError, RateLimitError, buildSourcesPack, buildPrompt } from "./chat";
 import { retrieveRelevantChunks, analyzeQuery, calculateAdaptiveK } from "./retrieval";
 import {
@@ -32,8 +32,9 @@ import { processNoteChunks } from "./chunking";
 import { getDb } from "./firestore";
 import { internalAuthMiddleware, isInternalAuthConfigured } from "./internalAuth";
 import { getVertexConfigStatus, isVertexConfigured } from "./vectorIndex";
-import { userAuthMiddleware, isUserAuthEnabled, perUserRateLimiter } from "./middleware";
+import { userAuthMiddleware, isUserAuthEnabled, perUserRateLimiter, audioUpload, getNormalizedMimeType, handleMulterError } from "./middleware";
 import { validateBody, validateQuery, validateParams } from "./middleware";
+import { transcribeAudio, TranscriptionError } from "./transcription";
 import { errorHandler, asyncHandler, Errors, ApiError } from "./errors";
 import {
   CreateNoteSchema,
@@ -44,6 +45,7 @@ import {
   CreateThreadSchema,
   ThreadIdParamSchema,
   ListThreadsQuerySchema,
+  TranscriptionOptionsSchema,
 } from "./schemas";
 import {
   createThread,
@@ -162,6 +164,45 @@ app.get(
     const { limit, cursor } = (req.validatedQuery || req.query) as any;
 
     const result = await listNotes(tenantId, limit, cursor);
+    res.status(200).json(result);
+  })
+);
+
+/**
+ * PUT /notes/:noteId - Update an existing note
+ *
+ * Requires: Firebase ID token in Authorization header
+ * Path params:
+ *   - noteId: string (required) - The note ID to update
+ * Request body:
+ *   - text: string (optional) - New note content (max 5000 chars)
+ *   - title: string (optional) - New title
+ *   - tags: string[] (optional) - New tags
+ *
+ * Response:
+ *   - 200: NoteResponse with updated note
+ *   - 400: Validation error
+ *   - 404: Note not found
+ *
+ * tenantId is derived from authenticated user's UID
+ */
+app.put(
+  "/notes/:noteId",
+  userAuthMiddleware,
+  perUserRateLimiter,
+  validateParams(NoteIdParamSchema),
+  validateBody(UpdateNoteSchema),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.user!.uid;
+    const { noteId } = (req.validatedParams || req.params) as any;
+    const { text, title, tags, metadata } = req.body;
+
+    const result = await updateNote(noteId, tenantId, { text, title, tags, metadata });
+
+    if (!result) {
+      throw Errors.noteNotFound(noteId);
+    }
+
     res.status(200).json(result);
   })
 );
@@ -317,6 +358,88 @@ app.post(
     });
 
     res.status(200).json({ status: 'recorded', requestId });
+  })
+);
+
+// ============================================
+// Transcription Endpoint (authenticated)
+// ============================================
+
+/**
+ * POST /transcribe - Transcribe audio to text (speech-to-text)
+ *
+ * Requires: Firebase ID token in Authorization header
+ * Request: multipart/form-data with 'audio' file field
+ * Optional query params:
+ *   - languageHint: string (e.g., 'en', 'es', 'fr')
+ *   - includeTimestamps: boolean
+ *   - includeSpeakerDiarization: boolean
+ *
+ * Response: {
+ *   text: string,
+ *   processingTimeMs: number,
+ *   model: string,
+ *   estimatedDurationSeconds?: number
+ * }
+ *
+ * Supported formats: MP3, WAV, WEBM, OGG, AAC, FLAC, AIFF
+ * Max file size: 20MB
+ */
+app.post(
+  "/transcribe",
+  userAuthMiddleware,
+  perUserRateLimiter,
+  (req, res, next) => {
+    // Handle multer upload with error handling
+    audioUpload.single('audio')(req, res, (err) => {
+      if (err) {
+        const uploadError = handleMulterError(err);
+        return res.status(400).json({
+          error: {
+            code: uploadError.code,
+            message: uploadError.message,
+          },
+        });
+      }
+      next();
+    });
+  },
+  asyncHandler(async (req, res) => {
+    // Validate file was uploaded
+    if (!req.file) {
+      throw Errors.badRequest('No audio file provided. Use "audio" field in multipart/form-data.');
+    }
+
+    // Parse and validate options from query params
+    const optionsResult = TranscriptionOptionsSchema.safeParse(req.query);
+    const options = optionsResult.success ? optionsResult.data : {};
+
+    // Get normalized MIME type
+    const mimeType = getNormalizedMimeType(req.file);
+
+    logInfo('Transcription request received', {
+      originalName: req.file.originalname,
+      mimeType,
+      sizeBytes: req.file.size,
+      options,
+    });
+
+    try {
+      // Perform transcription
+      const result = await transcribeAudio(req.file.buffer, mimeType, options);
+
+      res.status(200).json({
+        text: result.text,
+        processingTimeMs: result.processingTimeMs,
+        model: result.model,
+        estimatedDurationSeconds: result.estimatedDurationSeconds,
+      });
+    } catch (error) {
+      if (error instanceof TranscriptionError) {
+        throw Errors.badRequest(error.message);
+      }
+      throw error;
+    }
   })
 );
 

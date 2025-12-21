@@ -21,3 +21,9 @@ export {
   createRateLimiter,
 } from './rateLimiter';
 
+export {
+  audioUpload,
+  getNormalizedMimeType,
+  AudioUploadError,
+  handleMulterError,
+} from './audioUpload';

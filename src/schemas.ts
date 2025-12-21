@@ -186,3 +186,21 @@ export const ProcessNoteCallbackSchema = z.object({
 
 export type ProcessNoteCallbackInput = z.infer<typeof ProcessNoteCallbackSchema>;
 
+// ============================================================================
+// Transcription Schemas
+// ============================================================================
+
+/**
+ * Transcription request options (from query params or JSON body)
+ */
+export const TranscriptionOptionsSchema = z.object({
+  /** Language hint for better accuracy (e.g., 'en', 'es', 'fr') */
+  languageHint: z.string().max(10).optional(),
+  /** Include timestamps in transcription */
+  includeTimestamps: z.coerce.boolean().default(false),
+  /** Include speaker diarization */
+  includeSpeakerDiarization: z.coerce.boolean().default(false),
+});
+
+export type TranscriptionOptionsInput = z.infer<typeof TranscriptionOptionsSchema>;
+

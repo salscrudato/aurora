@@ -76,7 +76,7 @@ const MIN_CITATION_COVERAGE_STRICT = 0.6; // Warn if < 60% coverage after repair
 // Feature flags for enhanced verification
 const UNIFIED_PIPELINE_ENABLED = true;    // Use new unified citation verification pipeline
 const CONSISTENCY_ENFORCEMENT_ENABLED = true;  // Enforce response consistency
-const ENHANCED_PROMPTS_ENABLED = false;    // Use enhanced prompts with chain-of-citation (optional)
+const ENHANCED_PROMPTS_ENABLED = true;     // Use optimized v2 prompts (conversational, concise)
 
 // NOTE: MIN_CITATION_SCORE filtering is now done in retrieval (MIN_COMBINED_SCORE)
 // to ensure prompt source count == citationsMap.size EXACTLY.
@@ -741,7 +741,23 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
   const { citationsMap, sourceCount } = sourcesPack;
 
   // Build prompt with intent-aware instructions using SourcesPack
-  const prompt = buildPrompt(query, sourcesPack, queryAnalysis.intent);
+  // Use enhanced prompts (v2) when flag is enabled, otherwise use legacy prompts
+  let prompt: string;
+  let systemInstruction: string | undefined;
+
+  if (ENHANCED_PROMPTS_ENABLED) {
+    // Enhanced v2 prompts: separate system instruction + user prompt
+    const { systemPrompt, userPrompt } = buildCompleteEnhancedPrompt(
+      query,
+      chunks,
+      queryAnalysis.intent
+    );
+    systemInstruction = systemPrompt;
+    prompt = userPrompt;
+  } else {
+    // Legacy prompts: single combined prompt string
+    prompt = buildPrompt(query, sourcesPack, queryAnalysis.intent);
+  }
 
   // Call LLM with retry logic
   const client = getGenAIClient();
@@ -758,6 +774,7 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
           topP: CHAT_TOP_P,
           topK: CHAT_TOP_K,
           maxOutputTokens: LLM_MAX_OUTPUT_TOKENS,
+          ...(systemInstruction && { systemInstruction }),
         },
       });
     }, 'LLM generation');

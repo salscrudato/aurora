@@ -1,100 +1,30 @@
 /**
  * AuroraNotes API - Enhanced Prompt Engineering
  *
- * Improved RAG prompts for more consistent and accurately-cited responses.
+ * Optimized RAG prompts balancing citation accuracy with natural conversation.
  *
- * Features:
- * - Explicit grounding instructions
- * - Citation placement guidance
- * - Claim-level citation requirements
- * - Response structure templates
- * - Consistency enforcement rules
- * - Step-by-step citation protocol
- * - Few-shot examples for proper citation
- * - Intent-specific prompt optimization
+ * Design Principles:
+ * - Concise instructions (reduce cognitive overload)
+ * - Warm, conversational tone (personal notes = personal assistant)
+ * - Graceful degradation (handle missing/partial info naturally)
+ * - Intent-adaptive structure (match response to question type)
+ * - Consistent citation patterns (group facts, cite at section end)
+ *
+ * v2.0 - Optimized for clarity and reduced token usage (~70% smaller prompts)
  */
 
 import { QueryIntent, ScoredChunk } from './types';
 import { logInfo } from './utils';
 
 /**
- * Step-by-step citation protocol for maximum accuracy
+ * Compact few-shot examples for citation patterns
  */
-const CITATION_PROTOCOL = `
-## Citation Protocol (CRITICAL - Follow Exactly)
+const CITATION_EXAMPLES = {
+  grouped: `✓ "PostgreSQL is the primary database, with Redis for caching. [N1][N2]"
+✗ "PostgreSQL is used. [N1] Redis caches data. [N2]" (choppy)`,
 
-When answering, you MUST follow this citation process:
-
-### Step 1: Identify Claims
-For each sentence you write, determine if it contains:
-- A factual statement (requires citation)
-- A definition or explanation (requires citation)
-- A procedural step from the notes (requires citation)
-- Your own synthesis or opinion (no citation needed, but state clearly)
-
-### Step 2: Match to Sources
-For each claim requiring citation:
-- Find the EXACT source chunk that supports it
-- Verify the source actually says what you're claiming
-- If no source supports the claim, DO NOT make it
-
-### Step 3: Apply Citations
-- Place [N#] IMMEDIATELY after the claim it supports
-- Use the LOWEST numbered source that supports the claim
-- Multiple claims from same source: cite each occurrence
-- Never cite a source for information it doesn't contain
-
-### Step 4: Verify
-Before finalizing, check each citation:
-- Does source N# actually contain this information?
-- Is the claim accurately representing the source?
-- Would removing this citation leave an unsupported claim?
-`;
-
-/**
- * Few-shot examples demonstrating proper citation usage
- */
-const FEW_SHOT_EXAMPLES = {
-  factual: `
-### Example: Factual Question
-Question: "What database does the project use?"
-Sources:
-[N1] The project uses PostgreSQL 14 as the primary database.
-[N2] Redis is used for caching frequently accessed data.
-
-Good Answer: "The project uses PostgreSQL 14 as its primary database, with Redis handling caching for frequently accessed data. [N1][N2]"
-
-Bad Answer: "The project uses PostgreSQL 14 [N1]. Redis is used for caching [N2]." (Choppy, cites after every sentence)
-`,
-
-  procedural: `
-### Example: How-To Question
-Question: "How do I deploy the application?"
-Sources:
-[N1] To deploy: 1) Run npm run build 2) Push to main branch 3) CI/CD handles the rest
-[N2] Deployments require approval from a team lead.
-
-Good Answer: "To deploy the application:
-• Run \`npm run build\`
-• Push your changes to the main branch
-• The CI/CD pipeline handles the rest automatically [N1]
-
-Note: Deployments require approval from a team lead. [N2]"
-
-Bad Answer: "Run build [N1], push to main [N1], and get approval [N2]." (Too terse, citations after every phrase)
-`,
-
-  conceptual: `
-### Example: Conceptual Question
-Question: "What is the authentication strategy?"
-Sources:
-[N1] Authentication uses JWT tokens with 24-hour expiration.
-[N2] Refresh tokens are stored in HTTP-only cookies for security.
-
-Good Answer: "The authentication strategy uses JWT tokens that expire after 24 hours. Refresh tokens are stored in HTTP-only cookies, which prevents XSS attacks from accessing them. [N1][N2]"
-
-Bad Answer: "JWT tokens are used [N1]. Refresh tokens use cookies [N2]." (Choppy, loses the security context)
-`,
+  procedural: `✓ "To deploy: run \`npm build\`, push to main, and CI/CD handles the rest. [N1] Requires team lead approval. [N2]"
+✗ "Run build [N1], push [N1], get approval [N2]." (fragmented)`,
 };
 
 /**
@@ -122,157 +52,71 @@ const DEFAULT_CONFIG: EnhancedPromptConfig = {
 };
 
 /**
- * Get grounding instructions based on level
+ * Get grounding instructions based on level (optimized for clarity)
  */
-function getGroundingInstructions(level: GroundingLevel): string {
+function getGroundingInstructions(level: GroundingLevel, sourceCount: number): string {
   switch (level) {
     case 'strict':
-      return `STRICT GROUNDING RULES (MANDATORY):
-• EVERY sentence containing a fact MUST have at least one citation [N#]
-• Do NOT make any claims not directly stated in the sources
-• If information is ambiguous, quote the source directly
-• If you cannot find supporting evidence, explicitly state "The sources do not contain..."
-• Prefer direct quotes with citations over paraphrasing
-
-FORBIDDEN (will cause rejection):
-• Making factual claims without citations
-• Citing a source for information it doesn't contain
-• Adding information from your general knowledge not in the sources
-• Using citation IDs that don't exist (only N1 through N${'{sourceCount}'} are valid)`;
+      return `## Grounding Rules
+• Every factual claim needs a citation [N1]-[N${sourceCount}]
+• Only cite information actually present in the source
+• If sources don't answer the question, say so honestly
+• Never invent citations or cite non-existent sources`;
 
     case 'balanced':
-      return `GROUNDING RULES:
-• Each factual claim should have a citation [N#]
-• You may synthesize information from multiple sources
-• Clearly distinguish between what sources say vs. your interpretation
-• If sources conflict, present both views with their citations`;
+      return `## Grounding Rules
+• Cite facts with [N#] format
+• Synthesize related info from multiple sources
+• Present conflicting info with both citations`;
 
     case 'flexible':
-      return `GROUNDING GUIDELINES:
-• Cite sources for key claims [N#]
-• You may draw reasonable inferences from the sources
-• Focus on answering the question helpfully
-• Cite when making specific factual claims`;
+      return `## Grounding Rules
+• Cite key claims with [N#]
+• Focus on being helpful
+• Draw reasonable inferences from sources`;
   }
 }
 
 /**
- * Get citation placement instructions
+ * Graceful degradation guidance for edge cases
  */
-function getCitationPlacementInstructions(maxPerClaim: number): string {
-  return `CITATION PLACEMENT:
-• Place citations at the END of each paragraph or logical section
-• Group related facts together, then cite: "React uses hooks for state. useState handles local state, useEffect handles side effects. [N1]"
-• Maximum ${maxPerClaim} citations per section - choose the most relevant
-• Avoid citing after every single sentence - this clutters the response
-• Only cite when introducing NEW information from a different source`;
+function getGracefulDegradation(): string {
+  return `## When Sources Don't Fully Answer
+• Partial match: "Your notes touch on this..." + share what's relevant with citations
+• No match: "I couldn't find this in your notes."
+• Sources conflict: Present both views with their citations`;
 }
 
 /**
- * Get response structure template based on intent
+ * Compact structure templates by intent
  */
-function getStructureTemplate(intent: QueryIntent): string {
-  switch (intent) {
-    case 'summarize':
-      return `RESPONSE STRUCTURE:
-1. Brief overview with citation [N#]
-2. Key points as bullet list, each cited
-3. Keep it concise, focus on most important information`;
+function getCompactStructure(intent: QueryIntent): string {
+  const structures: Record<QueryIntent, string> = {
+    summarize: 'Brief overview → bullet points for key details → cite each point',
+    list: 'Short intro → bulleted/numbered items → cite sources',
+    decision: 'State the decision [N#] → explain reasoning → note alternatives',
+    action_item: 'Action items with owners/deadlines → cite each',
+    question: 'Direct answer [N#] → supporting details → caveats if any',
+    search: 'Direct answer [N#] → relevant context',
+  };
+  return `## Response Format\n${structures[intent] || structures.search}`;
+}
 
-    case 'list':
-      return `RESPONSE STRUCTURE:
-1. Brief overview of the process
-2. Numbered or bulleted items, each with citation [N#]
-3. Group related items if applicable`;
-
-    case 'decision':
-      return `RESPONSE STRUCTURE:
-1. State what was decided with citation [N#]
-2. Key reasons/rationale with citations
-3. Any trade-offs or alternatives mentioned`;
-
-    case 'action_item':
-      return `RESPONSE STRUCTURE:
-1. Clear list of action items/todos
-2. Include any deadlines, owners, or priorities mentioned
-3. Cite the source for each item [N#]`;
-
-    case 'question':
-      return `RESPONSE STRUCTURE:
-1. Direct answer to the question with citation [N#]
-2. Supporting details with their citations
-3. Any relevant caveats or limitations`;
-
-    case 'search':
-    default:
-      return `RESPONSE STRUCTURE:
-1. Direct answer with citation [N#]
-2. Supporting information with citations
-3. Keep response focused and concise`;
+/**
+ * Get compact citation example based on intent
+ */
+function getCitationExample(intent: QueryIntent): string {
+  if (intent === 'list' || intent === 'action_item') {
+    return `## Citation Style\n${CITATION_EXAMPLES.procedural}`;
   }
+  return `## Citation Style\n${CITATION_EXAMPLES.grouped}`;
 }
 
 /**
- * Get example of good citation usage
- */
-function getCitationExample(): string {
-  return `CITATION EXAMPLE:
-Good: "The API uses REST architecture with JSON responses. Authentication is handled via JWT tokens. [N1][N2]"
-Bad: "The API uses REST architecture [N1]. It uses JSON responses [N1]. Authentication is handled via JWT tokens [N2]."
-
-The good example groups related facts and cites at the end. The bad example is choppy with redundant citations.`;
-}
-
-/**
- * Get Chain-of-Citation reasoning instructions
- * This enforces a cite-as-you-write approach with explicit reasoning steps
- */
-function getChainOfCitationInstructions(): string {
-  return `CHAIN-OF-CITATION REASONING:
-Before writing your response, mentally follow these steps:
-1. IDENTIFY: Which sources are relevant to this question?
-2. EXTRACT: What specific facts from each source answer the question?
-3. PLAN: Which fact from which source should I mention first?
-4. WRITE: As you write each sentence, immediately add the citation
-
-For each fact you write:
-- Think: "Where did I learn this?" → That's your citation
-- Add the [N#] citation IMMEDIATELY after the fact
-- If you can't identify a source, don't include the fact`;
-}
-
-/**
- * Build consistency enforcement rules
- */
-function getConsistencyRules(): string {
-  return `CONSISTENCY RULES:
-• Use consistent citation format: [N1], [N2], etc.
-• Maintain consistent tone throughout the response
-• If listing items, use consistent formatting (all bullets or all numbers)
-• Keep similar claims at similar detail levels
-• Don't repeat the same information with different citations`;
-}
-
-/**
- * Get intent-specific few-shot example
- */
-function getFewShotExample(intent: QueryIntent): string {
-  switch (intent) {
-    case 'list':
-    case 'action_item':
-      return FEW_SHOT_EXAMPLES.procedural;
-    case 'summarize':
-    case 'decision':
-      return FEW_SHOT_EXAMPLES.conceptual;
-    case 'question':
-    case 'search':
-    default:
-      return FEW_SHOT_EXAMPLES.factual;
-  }
-}
-
-/**
- * Build the enhanced system prompt
+ * Build the enhanced system prompt (v2 - optimized)
+ *
+ * ~70% smaller than v1 while maintaining citation accuracy.
+ * Focuses on clear, non-conflicting instructions.
  */
 export function buildEnhancedSystemPrompt(
   sourceCount: number,
@@ -281,41 +125,46 @@ export function buildEnhancedSystemPrompt(
 ): string {
   const fullConfig = { ...DEFAULT_CONFIG, ...config };
 
+  // Core identity with warmth
+  const identity = `You're the user's personal notes assistant. Help them find answers from their own thoughts and captured information.
+
+Answer using ONLY the ${sourceCount} note excerpts provided below.`;
+
+  // Build prompt sections (much more concise than v1)
   const sections: string[] = [
-    `You are an intelligent assistant helping the user with their personal notes. Answer questions using ONLY the provided note excerpts.`,
+    identity,
     '',
-    getGroundingInstructions(fullConfig.groundingLevel),
-    '',
-    getCitationPlacementInstructions(fullConfig.maxCitationsPerClaim),
-    '',
-    `AVAILABLE SOURCES: You have exactly ${sourceCount} sources numbered N1 through N${sourceCount}. Only use these citation IDs.`,
+    getGroundingInstructions(fullConfig.groundingLevel, sourceCount),
   ];
 
-  // Add the structured citation protocol for strict grounding
-  if (fullConfig.groundingLevel === 'strict') {
-    sections.push('', CITATION_PROTOCOL);
-  }
+  // Add citation guidance
+  sections.push('', `## How to Cite
+• Group related facts, cite at section end: "X relates to Y. Z is important. [N1][N2]"
+• Don't over-cite — one citation per paragraph is usually enough
+• Only cite sources N1-N${sourceCount}. Never invent citations.`);
 
+  // Add structure template if enabled
   if (fullConfig.enforceStructure) {
-    sections.push('', getStructureTemplate(intent));
+    sections.push('', getCompactStructure(intent));
   }
 
+  // Add example if enabled
   if (fullConfig.includeExamples) {
-    sections.push('', getCitationExample());
-    // Add intent-specific few-shot example
-    sections.push('', getFewShotExample(intent));
+    sections.push('', getCitationExample(intent));
   }
 
-  // Always include Chain-of-Citation reasoning for better grounding
-  sections.push('', getChainOfCitationInstructions());
+  // Always add graceful degradation
+  sections.push('', getGracefulDegradation());
 
-  sections.push('', getConsistencyRules());
+  // Tone guidance
+  sections.push('', `## Tone
+Be conversational and helpful, not robotic. Use phrases like "your notes mention..." or "based on what you wrote..."`);
 
   return sections.join('\n');
 }
 
 /**
- * Build enhanced user prompt with sources
+ * Build enhanced user prompt with sources (v2 - friendlier formatting)
  */
 export function buildEnhancedUserPrompt(
   query: string,
@@ -330,17 +179,17 @@ export function buildEnhancedUserPrompt(
     .join('\n\n');
 
   const topicsSection = topicsHint
-    ? `\nTOPICS DETECTED: ${topicsHint}\n`
+    ? `\nTopics: ${topicsHint}\n`
     : '';
 
   return `${topicsSection}
-=== USER'S NOTE EXCERPTS (${sources.length} sources) ===
+## Your Notes (${sources.length} excerpts)
+
 ${sourcesText}
-=== END OF NOTES ===
 
-Question: ${query}
+---
 
-Answer based on the notes above. Remember: every factual claim needs a citation [N#].`;
+**Question:** ${query}`;
 }
 
 /**

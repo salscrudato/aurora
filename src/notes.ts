@@ -301,7 +301,7 @@ export async function getNote(
 ): Promise<NoteResponse | null> {
   const db = getDb();
   const doc = await db.collection(NOTES_COLLECTION).doc(noteId).get();
-  
+
   if (!doc.exists) return null;
 
   const data = doc.data() as NoteDoc;
@@ -310,6 +310,196 @@ export async function getNote(
   if (data.tenantId !== tenantId) return null;
 
   return docToResponse(data);
+}
+
+/**
+ * Options for updating a note
+ */
+export interface UpdateNoteOptions {
+  title?: string;
+  text?: string;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Update an existing note
+ *
+ * This operation:
+ * 1. Validates the note exists and belongs to the tenant
+ * 2. Updates the note fields
+ * 3. Re-processes chunks if text was changed
+ * 4. Invalidates the tenant cache
+ *
+ * @param noteId - The ID of the note to update
+ * @param tenantId - The tenant ID for ownership verification
+ * @param options - Fields to update
+ * @returns NoteResponse on success, null if note not found or access denied
+ * @throws Error if update fails
+ */
+export async function updateNote(
+  noteId: string,
+  tenantId: string = DEFAULT_TENANT_ID,
+  options: UpdateNoteOptions = {}
+): Promise<NoteResponse | null> {
+  const db = getDb();
+  const startTime = Date.now();
+
+  // Validate inputs
+  if (!noteId || typeof noteId !== 'string') {
+    throw new Error('noteId is required');
+  }
+
+  if (!isValidTenantId(tenantId)) {
+    throw new Error('invalid tenantId format');
+  }
+
+  // Ensure at least one field is being updated
+  if (!options.text && !options.title && !options.tags && !options.metadata) {
+    throw new Error('at least one field must be provided for update');
+  }
+
+  // Validate text if provided
+  if (options.text !== undefined) {
+    const sanitizedText = sanitizeText(options.text, MAX_NOTE_LENGTH + 100);
+    const trimmedText = sanitizedText.trim();
+
+    if (!trimmedText) {
+      throw new Error('text cannot be empty');
+    }
+
+    if (trimmedText.length > MAX_NOTE_LENGTH) {
+      throw new Error(`text too long (max ${MAX_NOTE_LENGTH})`);
+    }
+
+    options.text = trimmedText;
+  }
+
+  // Fetch the note to verify it exists and belongs to the tenant
+  const noteRef = db.collection(NOTES_COLLECTION).doc(noteId);
+  const noteDoc = await noteRef.get();
+
+  if (!noteDoc.exists) {
+    return null; // Note not found
+  }
+
+  const noteData = noteDoc.data() as NoteDoc;
+
+  // Verify tenant ownership (security check)
+  if (noteData.tenantId !== tenantId) {
+    logWarn('Update note denied - tenant mismatch', {
+      noteId,
+      requestedTenant: tenantId,
+      actualTenant: noteData.tenantId,
+    });
+    return null; // Access denied - treat as not found for security
+  }
+
+  // Build update object
+  const updateData: Partial<NoteDoc> = {
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+
+  const textChanged = options.text !== undefined && options.text !== noteData.text;
+
+  if (options.text !== undefined) {
+    updateData.text = options.text;
+    // Mark for re-processing if text changed
+    if (textChanged) {
+      updateData.processingStatus = 'pending';
+    }
+  }
+
+  if (options.title !== undefined) {
+    updateData.title = options.title.trim().slice(0, 500);
+  }
+
+  if (options.tags !== undefined) {
+    updateData.tags = options.tags.slice(0, 20).map(t => t.trim().slice(0, 50));
+  }
+
+  if (options.metadata !== undefined) {
+    updateData.metadata = options.metadata;
+  }
+
+  // Update the note
+  await noteRef.update(updateData);
+
+  // If text changed, delete old chunks and re-process
+  if (textChanged) {
+    try {
+      // Delete existing chunks
+      const chunksSnap = await db
+        .collection(CHUNKS_COLLECTION)
+        .where('noteId', '==', noteId)
+        .get();
+
+      if (!chunksSnap.empty) {
+        const chunkIds: string[] = [];
+        const BATCH_SIZE = 400;
+
+        for (let i = 0; i < chunksSnap.docs.length; i += BATCH_SIZE) {
+          const batch = db.batch();
+          const batchDocs = chunksSnap.docs.slice(i, i + BATCH_SIZE);
+
+          for (const chunkDoc of batchDocs) {
+            chunkIds.push(chunkDoc.id);
+            batch.delete(chunkDoc.ref);
+          }
+
+          await batch.commit();
+        }
+
+        // Remove from Vertex index
+        const vertexIndex = getVertexIndex();
+        if (vertexIndex && chunkIds.length > 0) {
+          try {
+            await vertexIndex.remove(chunkIds);
+          } catch (vertexErr) {
+            logError('Failed to remove old chunks from Vertex index during update', vertexErr, {
+              noteId,
+              chunkCount: chunkIds.length,
+            });
+          }
+        }
+      }
+
+      // Fetch updated note data and re-process chunks
+      const updatedDoc = await noteRef.get();
+      const updatedData = updatedDoc.data() as NoteDoc;
+
+      await processNoteChunks(updatedData);
+
+      // Mark as ready
+      await noteRef.update({
+        processingStatus: 'ready',
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    } catch (err) {
+      // Mark as failed but don't fail the update
+      await noteRef.update({
+        processingStatus: 'failed',
+        processingError: err instanceof Error ? err.message : 'Unknown error',
+      });
+      logError('Chunk re-processing failed during note update', err, { noteId });
+    }
+  }
+
+  // Invalidate cache
+  invalidateTenantCache(tenantId);
+
+  // Fetch final state
+  const finalDoc = await noteRef.get();
+  const finalData = finalDoc.data() as NoteDoc;
+
+  logInfo('Note updated', {
+    noteId,
+    tenantId,
+    textChanged,
+    elapsedMs: Date.now() - startTime,
+  });
+
+  return docToResponse(finalData);
 }
 
 /**
