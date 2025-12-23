@@ -188,7 +188,7 @@ export function applyRRFScoring(
       ? chunk.createdAt.toDate()
       : new Date();
 
-    scoredChunks.push({
+    const scoredChunk: ScoredChunk = {
       chunkId: chunk.chunkId,
       noteId: chunk.noteId,
       tenantId: chunk.tenantId,
@@ -201,7 +201,12 @@ export function applyRRFScoring(
       recencyScore: recencyScores.get(chunkId) || 0,
       // Additional RRF metadata
       sourceCount: result.contributingSources.length,
-    });
+    };
+    // Include offset information for precise citation anchoring (if available)
+    if (chunk.startOffset !== undefined) scoredChunk.startOffset = chunk.startOffset;
+    if (chunk.endOffset !== undefined) scoredChunk.endOffset = chunk.endOffset;
+    if (chunk.anchor) scoredChunk.anchor = chunk.anchor;
+    scoredChunks.push(scoredChunk);
   }
 
   // Sort by RRF score descending

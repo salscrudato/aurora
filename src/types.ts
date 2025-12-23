@@ -11,6 +11,22 @@ import { FieldValue, Timestamp } from "firebase-admin/firestore";
 /** Note processing status */
 export type ProcessingStatus = 'pending' | 'processing' | 'ready' | 'failed';
 
+/** Note type classification */
+export type NoteType = 'meeting' | 'idea' | 'task' | 'reference' | 'journal' | 'other';
+
+/** Action item extracted from note */
+export interface ActionItem {
+  text: string;
+  completed: boolean;
+  dueDate?: string;
+}
+
+/** Named entity extracted from note */
+export interface Entity {
+  text: string;
+  type: 'person' | 'organization' | 'location' | 'date' | 'product' | 'other';
+}
+
 /** Note document in Firestore */
 export interface NoteDoc {
   id: string;
@@ -27,6 +43,16 @@ export interface NoteDoc {
   tags?: string[];
   /** Custom metadata */
   metadata?: Record<string, unknown>;
+  /** AI-generated summary of the note */
+  summary?: string;
+  /** Classified note type */
+  noteType?: NoteType;
+  /** Extracted action items */
+  actionItems?: ActionItem[];
+  /** Extracted named entities */
+  entities?: Entity[];
+  /** Enrichment status (separate from chunk processing) */
+  enrichmentStatus?: ProcessingStatus;
   createdAt: Timestamp | FieldValue;
   updatedAt: Timestamp | FieldValue;
 }
@@ -40,6 +66,16 @@ export interface NoteResponse {
   processingStatus?: ProcessingStatus;
   tags?: string[];
   metadata?: Record<string, unknown>;
+  /** AI-generated summary of the note */
+  summary?: string;
+  /** Classified note type */
+  noteType?: NoteType;
+  /** Extracted action items */
+  actionItems?: ActionItem[];
+  /** Extracted named entities */
+  entities?: Entity[];
+  /** Enrichment status */
+  enrichmentStatus?: ProcessingStatus;
   createdAt: string;
   updatedAt: string;
 }
@@ -82,6 +118,10 @@ export interface ChunkDoc {
   prevContext?: string;      // Last ~100 chars from previous chunk
   nextContext?: string;      // First ~100 chars from next chunk
   totalChunks?: number;      // Total chunks in this note (for context)
+  // Character offsets for precise citation anchoring
+  startOffset?: number;      // Start character offset in original note text
+  endOffset?: number;        // End character offset in original note text
+  anchor?: string;           // First ~50 chars for deep-linking/highlighting
 }
 
 /** Chunk with score for retrieval */
@@ -101,6 +141,10 @@ export interface ScoredChunk {
   nextContext?: string;        // Context from next chunk
   sourceCount?: number;        // Number of retrieval sources that found this chunk (for RRF)
   embedding?: number[];        // Embedding vector (for semantic deduplication)
+  // Character offsets for precise citation anchoring
+  startOffset?: number;        // Start character offset in original note text
+  endOffset?: number;          // End character offset in original note text
+  anchor?: string;             // First ~50 chars for deep-linking/highlighting
 }
 
 // ============================================
@@ -132,6 +176,12 @@ export interface Source {
   date: string;
   /** Relevance score (0-1) for display confidence */
   relevance: number;
+  /** Start character offset in original note (for highlighting) */
+  startOffset?: number;
+  /** End character offset in original note (for highlighting) */
+  endOffset?: number;
+  /** Anchor text for deep-linking (first ~50 chars of chunk) */
+  anchor?: string;
 }
 
 /** Citation in chat response - kept for backwards compatibility */
@@ -142,6 +192,12 @@ export interface Citation {
   createdAt: string;    // ISO string
   snippet: string;
   score: number;
+  /** Start character offset in original note */
+  startOffset?: number;
+  /** End character offset in original note */
+  endOffset?: number;
+  /** Anchor text for deep-linking */
+  anchor?: string;
 }
 
 /** Chat request body */
@@ -167,6 +223,20 @@ export interface ResponseMeta {
   confidence: ConfidenceLevel;
   /** Number of sources used */
   sourceCount: number;
+  /** Thread ID if part of a conversation */
+  threadId?: string;
+  /** Action result for agentic queries */
+  action?: {
+    type: string;
+    success: boolean;
+    data?: unknown;
+  };
+  /** Retrieval details (optional) */
+  retrieval?: {
+    strategy: string;
+    candidateCount?: number;
+    k: number;
+  };
   /** Retrieval details (optional, for debugging) */
   debug?: {
     strategy: string;
@@ -257,6 +327,20 @@ export interface QueryAnalysis {
   boostTerms?: string[];      // Terms to boost in scoring
 }
 
+/** Note filter options for scoped retrieval */
+export interface NoteFilterOptions {
+  /** Only include chunks from these specific note IDs */
+  noteIds?: string[];
+  /** Exclude chunks from these note IDs */
+  excludeNoteIds?: string[];
+  /** Only include notes with any of these tags (OR logic) */
+  tags?: string[];
+  /** Only include notes created on or after this date */
+  dateFrom?: Date;
+  /** Only include notes created on or before this date */
+  dateTo?: Date;
+}
+
 /** Retrieval options */
 export interface RetrievalOptions {
   tenantId: string;
@@ -270,6 +354,10 @@ export interface RetrievalOptions {
   requestId?: string;           // For logging correlation
   // Dynamic context budget (overrides LLM_CONTEXT_BUDGET_CHARS)
   contextBudget?: number;       // Max characters for source context
+  // Note filtering options
+  noteFilters?: NoteFilterOptions;
+  // Minimum relevance score threshold
+  minRelevance?: number;
 }
 
 // ============================================
@@ -342,6 +430,8 @@ export interface ThreadDoc {
   tenantId: string;
   /** Optional title (auto-generated from first message if not provided) */
   title?: string;
+  /** Rolling summary of the conversation (updated periodically) */
+  summary?: string;
   /** Messages in the thread (stored inline for simplicity) */
   messages: ThreadMessage[];
   /** Custom metadata */
@@ -357,6 +447,8 @@ export interface ThreadResponse {
   id: string;
   tenantId: string;
   title?: string;
+  /** Rolling summary of the conversation */
+  summary?: string;
   messageCount: number;
   lastActivityAt: string;
   createdAt: string;
@@ -379,4 +471,18 @@ export interface ThreadsListResponse {
   threads: ThreadResponse[];
   cursor: string | null;
   hasMore: boolean;
+}
+
+/** Paginated messages response for a thread */
+export interface ThreadMessagesResponse {
+  messages: Array<{
+    id: string;
+    role: MessageRole;
+    content: string;
+    sources?: Source[];
+    createdAt: string;
+  }>;
+  cursor: string | null;
+  hasMore: boolean;
+  totalCount: number;
 }

@@ -18,27 +18,46 @@ import { logInfo, logError } from "./utils";
 import { CHAT_MODEL } from "./config";
 
 // SSE Event types
-export type StreamEventType = 'token' | 'sources' | 'done' | 'error';
+export type StreamEventType = 'token' | 'sources' | 'done' | 'error' | 'heartbeat' | 'followups' | 'context_sources';
 
 export interface StreamSource {
   id: string;
   noteId: string;
   preview: string;
   date: string;
+  /** Start character offset in original note (for highlighting) */
+  startOffset?: number;
+  /** End character offset in original note (for highlighting) */
+  endOffset?: number;
+  /** Anchor text for deep-linking */
+  anchor?: string;
+}
+
+/** Context source - a source that was retrieved but not cited */
+export interface ContextSource {
+  noteId: string;
+  preview: string;
+  date: string;
+  relevance: number;
 }
 
 export interface StreamEvent {
   type: StreamEventType;
   content?: string;
   sources?: StreamSource[];
+  contextSources?: ContextSource[];
+  followups?: string[];
   meta?: {
     model: string;
     requestId?: string;
     responseTimeMs: number;
     confidence: ConfidenceLevel;
     sourceCount: number;
+    contextSourceCount?: number;
   };
   error?: string;
+  /** Heartbeat sequence number */
+  seq?: number;
 }
 
 /**
@@ -68,6 +87,37 @@ export function closeSSE(res: Response): void {
 }
 
 /**
+ * Generate follow-up suggestions based on response content
+ */
+function generateFollowUps(fullText: string, sourceCount: number): string[] {
+  const followups: string[] = [];
+
+  // If we mentioned multiple topics or sources, suggest drilling down
+  if (sourceCount >= 3) {
+    followups.push('Can you elaborate on the most important point?');
+  }
+
+  // If response mentions lists or items
+  if (/\d+\.\s|•\s|-\s/.test(fullText)) {
+    followups.push('Tell me more about the first item');
+  }
+
+  // If response asks a question or implies uncertainty
+  if (/\?/.test(fullText) || /I'm not sure|unclear|might|could be/.test(fullText)) {
+    followups.push('What additional context would help?');
+  }
+
+  // General follow-ups
+  if (followups.length === 0) {
+    followups.push('Can you summarize this in a single sentence?');
+  }
+
+  followups.push('What related notes should I review?');
+
+  return followups.slice(0, 3); // Return max 3 suggestions
+}
+
+/**
  * Stream a chat response using Gemini's streaming API
  *
  * @param res - Express response object
@@ -84,6 +134,10 @@ export async function streamChatResponse(
     temperature?: number;
     maxTokens?: number;
     requestId?: string;
+    /** Include context sources (retrieved but not cited) */
+    includeContextSources?: boolean;
+    /** All retrieved chunks for context sources */
+    allChunks?: Array<{ noteId: string; text: string; score: number; createdAt: Date }>;
   } = {}
 ): Promise<{ fullText: string; tokenCount: number }> {
   const {
@@ -91,31 +145,81 @@ export async function streamChatResponse(
     temperature = 0.7,
     maxTokens = 2000,
     requestId,
+    includeContextSources = true,
+    allChunks = [],
   } = options;
 
   const startTime = Date.now();
   let fullText = '';
   let tokenCount = 0;
+  let heartbeatSeq = 0;
+  let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 
   try {
     const client = getGenAIClient();
 
     // Build human-readable sources for streaming display
     // Send ALL sources - no artificial cap (was slice(0, 5))
+    const citedNoteIds = new Set<string>();
     const streamSources: StreamSource[] = Array.from(sourcesPack.citationsMap.entries())
-      .map(([cid, citation]) => ({
-        id: cid.replace('N', ''),
-        noteId: citation.noteId,
-        preview: citation.snippet.length > 100 ? citation.snippet.slice(0, 97) + '...' : citation.snippet,
-        date: new Date(citation.createdAt).toLocaleDateString('en-US', {
-          month: 'short',
-          day: 'numeric',
-          year: 'numeric',
-        }),
-      }));
+      .map(([cid, citation]) => {
+        citedNoteIds.add(citation.noteId);
+        return {
+          id: cid.replace('N', ''),
+          noteId: citation.noteId,
+          preview: citation.snippet.length > 100 ? citation.snippet.slice(0, 97) + '...' : citation.snippet,
+          date: new Date(citation.createdAt).toLocaleDateString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric',
+          }),
+          // Include offset information for precise citation anchoring
+          startOffset: citation.startOffset,
+          endOffset: citation.endOffset,
+          anchor: citation.anchor,
+        };
+      });
 
     // Send sources first so client can display them
     sendSSEEvent(res, { type: 'sources', sources: streamSources });
+
+    // Build context sources (chunks that were retrieved but not cited)
+    if (includeContextSources && allChunks.length > 0) {
+      const contextSources: ContextSource[] = [];
+      const seenNoteIds = new Set<string>();
+
+      for (const chunk of allChunks) {
+        // Skip if this note was cited or already included
+        if (citedNoteIds.has(chunk.noteId) || seenNoteIds.has(chunk.noteId)) {
+          continue;
+        }
+        seenNoteIds.add(chunk.noteId);
+
+        contextSources.push({
+          noteId: chunk.noteId,
+          preview: chunk.text.length > 100 ? chunk.text.slice(0, 97) + '...' : chunk.text,
+          date: chunk.createdAt.toLocaleDateString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric',
+          }),
+          relevance: chunk.score,
+        });
+
+        // Limit to 5 context sources
+        if (contextSources.length >= 5) break;
+      }
+
+      if (contextSources.length > 0) {
+        sendSSEEvent(res, { type: 'context_sources', contextSources });
+      }
+    }
+
+    // Start heartbeat to keep connection alive during long operations
+    heartbeatInterval = setInterval(() => {
+      heartbeatSeq++;
+      sendSSEEvent(res, { type: 'heartbeat', seq: heartbeatSeq });
+    }, STREAMING_CONFIG.heartbeatIntervalMs);
 
     // Stream generation
     const response = await client.models.generateContentStream({
@@ -139,6 +243,18 @@ export async function streamChatResponse(
       }
     }
 
+    // Stop heartbeat
+    if (heartbeatInterval) {
+      clearInterval(heartbeatInterval);
+      heartbeatInterval = null;
+    }
+
+    // Generate and send follow-up suggestions
+    const followups = generateFollowUps(fullText, sourcesPack.sourceCount);
+    if (followups.length > 0) {
+      sendSSEEvent(res, { type: 'followups', followups });
+    }
+
     // Send done event with metadata
     const elapsedMs = Date.now() - startTime;
 
@@ -154,6 +270,7 @@ export async function streamChatResponse(
         responseTimeMs: elapsedMs,
         confidence,
         sourceCount: sourcesPack.sourceCount,
+        contextSourceCount: allChunks.length - citedNoteIds.size,
       },
     });
 
@@ -162,6 +279,7 @@ export async function streamChatResponse(
       tokenCount,
       elapsedMs,
       model,
+      followupCount: followups.length,
     });
 
     return { fullText, tokenCount };
@@ -173,6 +291,10 @@ export async function streamChatResponse(
     });
     throw err;
   } finally {
+    // Ensure heartbeat is stopped
+    if (heartbeatInterval) {
+      clearInterval(heartbeatInterval);
+    }
     closeSSE(res);
   }
 }

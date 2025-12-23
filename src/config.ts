@@ -61,6 +61,7 @@ export const RETRIEVAL_TOP_K = envInt('RETRIEVAL_TOP_K', 30);           // Initi
 export const RETRIEVAL_RERANK_TO = envInt('RETRIEVAL_RERANK_TO', 8);    // After reranking
 export const RETRIEVAL_DEFAULT_DAYS = envInt('RETRIEVAL_DEFAULT_DAYS', 90);
 export const RETRIEVAL_MAX_CONTEXT_CHARS = envInt('RETRIEVAL_MAX_CONTEXT_CHARS', 12000);
+export const RETRIEVAL_MIN_RELEVANCE = parseFloat(process.env.RETRIEVAL_MIN_RELEVANCE || '0.25'); // Minimum relevance score threshold
 
 // ============================================
 // Chat / LLM Config (tuned for accuracy + repeatability)

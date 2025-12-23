@@ -27,7 +27,25 @@ const PIPELINE_CONFIG = {
   enableSemanticCheck: false,   // Semantic scoring (disabled by default for speed)
   strictMode: true,             // Remove weak citations from response
   warnOnLowCoverage: true,      // Log warning if < 50% of sources cited
+  enableHallucinationCheck: true, // Check for potential hallucinations
 };
+
+// Hallucination detection patterns - claims that are likely hallucinated
+const HALLUCINATION_PATTERNS = [
+  // Specific numbers/dates without source support
+  /\b(exactly|precisely|specifically)\s+\d+/i,
+  // False certainty markers when sources are weak
+  /\b(definitely|certainly|absolutely|always|never)\b/i,
+  // Made-up quotes
+  /"[^"]{50,}"(?!\s*\[N\d+\])/,  // Long quotes without citation
+];
+
+// Common LLM fabrication indicators
+const FABRICATION_INDICATORS = [
+  'as mentioned in your notes',
+  'your notes indicate',
+  'according to your notes',
+].map(s => s.toLowerCase());
 
 // ============================================
 // Core Types
@@ -64,6 +82,7 @@ export interface PipelineResult {
   invalidCitationsRemoved: string[];  // CIDs removed from answer
   weakCitations: string[];            // CIDs with low but passing scores
   hasContradictions: boolean;         // Detected contradictions
+  potentialHallucinations: string[];  // Segments that may be hallucinated
 
   // Contract compliance
   contractCompliant: boolean;     // Every answer citation exists in sources
@@ -97,6 +116,54 @@ function extractKeywords(text: string): Set<string> {
       .split(/\s+/)
       .filter(w => w.length > 2 && !STOP_WORDS.has(w))
   );
+}
+
+/**
+ * Detect potential hallucinations in the answer
+ * Returns array of potentially hallucinated segments
+ */
+function detectPotentialHallucinations(
+  answer: string,
+  citationValidations: CitationValidation[]
+): string[] {
+  if (!PIPELINE_CONFIG.enableHallucinationCheck) return [];
+
+  const hallucinations: string[] = [];
+  const answerLower = answer.toLowerCase();
+
+  // Check for fabrication indicators without valid citations nearby
+  for (const indicator of FABRICATION_INDICATORS) {
+    const idx = answerLower.indexOf(indicator);
+    if (idx >= 0) {
+      // Get the surrounding context (50 chars before/after)
+      const start = Math.max(0, idx - 30);
+      const end = Math.min(answer.length, idx + indicator.length + 50);
+      const context = answer.slice(start, end);
+
+      // Check if there's a valid citation in this context
+      const citationMatch = context.match(/\[N(\d+)\]/);
+      if (!citationMatch) {
+        hallucinations.push(`Unsupported claim: "${context.trim()}"`);
+      } else {
+        // Check if the citation is actually valid
+        const cid = `N${citationMatch[1]}`;
+        const validation = citationValidations.find(v => v.cid === cid);
+        if (validation && validation.matchQuality === 'none') {
+          hallucinations.push(`Weakly supported: "${context.trim()}"`);
+        }
+      }
+    }
+  }
+
+  // Check for specific claims that might be fabricated
+  for (const pattern of HALLUCINATION_PATTERNS) {
+    const match = answer.match(pattern);
+    if (match) {
+      hallucinations.push(`Potential fabrication: "${match[0].slice(0, 50)}..."`);
+    }
+  }
+
+  return hallucinations.slice(0, 3); // Limit to top 3 concerns
 }
 
 /**
@@ -352,6 +419,9 @@ export async function runUnifiedCitationPipeline(
     });
   }
 
+  // Detect potential hallucinations
+  const potentialHallucinations = detectPotentialHallucinations(answer, citationValidations);
+
   const processingTimeMs = Date.now() - startTime;
 
   return {
@@ -363,6 +433,7 @@ export async function runUnifiedCitationPipeline(
     invalidCitationsRemoved,
     weakCitations,
     hasContradictions: false, // Contradiction detection removed for simplicity
+    potentialHallucinations,
     contractCompliant,
     danglingCitations,
     processingTimeMs,

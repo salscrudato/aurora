@@ -1,21 +1,71 @@
-import admin from "firebase-admin";
+/**
+ * AuroraNotes API - Firestore Database Connection
+ *
+ * Provides a singleton Firestore instance for the application.
+ * Initializes Firebase Admin SDK and exports the database getter.
+ */
 
-let app: admin.app.App | null = null;
+import { initializeApp, getApps, cert, App } from "firebase-admin/app";
+import { getFirestore, Firestore } from "firebase-admin/firestore";
+import { PROJECT_ID } from "./config";
 
-export function getDb() {
-  if (!app) {
-    // On Cloud Run, default credentials are provided via the service account.
-    // Use GOOGLE_CLOUD_PROJECT env var to ensure we connect to the correct project.
-    const projectId = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
+let app: App | null = null;
+let db: Firestore | null = null;
 
-    if (projectId) {
-      app = admin.initializeApp({
-        projectId: projectId,
-      });
-    } else {
-      // Fallback to default (will use metadata server project)
-      app = admin.initializeApp();
-    }
+/**
+ * Initialize Firebase Admin SDK if not already initialized
+ */
+function initializeFirebase(): App {
+  if (getApps().length > 0) {
+    return getApps()[0];
   }
-  return admin.firestore();
+
+  // In production (Cloud Run), use default credentials
+  // In development, use GOOGLE_APPLICATION_CREDENTIALS env var
+  const serviceAccount = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+
+  if (serviceAccount) {
+    // Local development with service account file
+    return initializeApp({
+      credential: cert(serviceAccount),
+      projectId: PROJECT_ID,
+    });
+  } else {
+    // Production: use default credentials (Cloud Run service account)
+    return initializeApp({
+      projectId: PROJECT_ID,
+    });
+  }
 }
+
+/**
+ * Get the Firestore database instance
+ *
+ * Lazily initializes Firebase Admin SDK on first call.
+ * Returns the same instance for subsequent calls.
+ */
+export function getDb(): Firestore {
+  if (!db) {
+    if (!app) {
+      app = initializeFirebase();
+    }
+    db = getFirestore(app);
+
+    // Enable settings for better performance
+    db.settings({
+      ignoreUndefinedProperties: true,
+    });
+  }
+  return db;
+}
+
+/**
+ * Get the Firebase Admin App instance
+ */
+export function getApp(): App {
+  if (!app) {
+    app = initializeFirebase();
+  }
+  return app;
+}
+

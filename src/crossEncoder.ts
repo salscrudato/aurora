@@ -92,6 +92,37 @@ function evictCrossEncoderCache(): void {
   }
 }
 
+// Query type detection for adaptive scoring criteria
+type QueryType = 'factual' | 'procedural' | 'exploratory' | 'temporal';
+
+function detectQueryType(query: string): QueryType {
+  const lower = query.toLowerCase();
+  if (/\b(when|date|time|yesterday|today|last|recent|week|month)\b/.test(lower)) return 'temporal';
+  if (/\b(how|steps|process|procedure|guide|tutorial|instructions)\b/.test(lower)) return 'procedural';
+  if (/\b(what is|who is|define|explain|meaning)\b/.test(lower)) return 'factual';
+  return 'exploratory';
+}
+
+// Query-type specific scoring guidance
+const SCORING_GUIDANCE: Record<QueryType, string> = {
+  factual: `- Direct answer with exact facts = 9-10
+- Contains the specific information = 7-8
+- Related but not definitive = 4-6
+- Only tangentially related = 1-3`,
+  procedural: `- Complete step-by-step instructions = 9-10
+- Partial steps or process = 7-8
+- Related procedures = 4-6
+- Only mentions the topic = 1-3`,
+  temporal: `- Contains exact dates/times asked about = 9-10
+- Has relevant temporal info = 7-8
+- General timeline context = 4-6
+- No temporal relevance = 1-3`,
+  exploratory: `- Comprehensive coverage of topic = 9-10
+- Significant relevant details = 7-8
+- Some useful context = 4-6
+- Peripheral information = 1-3`,
+};
+
 // Pre-built prompt template (avoid string concatenation in hot path)
 const PROMPT_TEMPLATE_PREFIX = `You are a relevance scoring system. Score each passage's relevance to the query on a scale of 0-10.
 
@@ -100,17 +131,17 @@ const PROMPT_TEMPLATE_MIDDLE = `"
 
 Passages:
 `;
-const PROMPT_TEMPLATE_SUFFIX = `
+// Dynamic suffix is built based on query type
+function buildPromptSuffix(queryType: QueryType): string {
+  return `
 
 For each passage, output ONLY a JSON array of scores in order, like: [8, 3, 9, 5, ...]
-Consider:
-- Direct answer to the query = 9-10
-- Highly relevant context = 7-8
-- Somewhat relevant = 4-6
-- Tangentially related = 1-3
+Scoring criteria for this ${queryType} query:
+${SCORING_GUIDANCE[queryType]}
 - Not relevant = 0
 
 Scores:`;
+}
 
 /**
  * Check if cross-encoder reranking is available
@@ -154,8 +185,11 @@ async function scoreWithGemini(
   }
   const passageList = passageParts.join('\n\n');
 
-  // Build prompt using pre-built template parts
-  const prompt = PROMPT_TEMPLATE_PREFIX + query + PROMPT_TEMPLATE_MIDDLE + passageList + PROMPT_TEMPLATE_SUFFIX;
+  // Detect query type for adaptive scoring criteria
+  const queryType = detectQueryType(query);
+
+  // Build prompt using pre-built template parts with adaptive suffix
+  const prompt = PROMPT_TEMPLATE_PREFIX + query + PROMPT_TEMPLATE_MIDDLE + passageList + buildPromptSuffix(queryType);
 
   try {
     const timeoutPromise = new Promise<never>((_, reject) => {

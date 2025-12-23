@@ -164,17 +164,43 @@ Be conversational and helpful, not robotic. Use phrases like "your notes mention
 }
 
 /**
+ * Source with optional relevance score for quality hints
+ */
+interface EnhancedSource {
+  cid: string;
+  text: string;
+  noteTitle?: string;
+  relevanceScore?: number;
+}
+
+/**
+ * Get relevance indicator for source quality hints
+ */
+function getRelevanceIndicator(score: number | undefined): string {
+  if (score === undefined) return '';
+  if (score >= 0.80) return '★★★ '; // Highly relevant
+  if (score >= 0.60) return '★★ ';  // Relevant
+  if (score >= 0.40) return '★ ';   // Somewhat relevant
+  return '';                         // Lower relevance - no indicator
+}
+
+/**
  * Build enhanced user prompt with sources (v2 - friendlier formatting)
+ * Now includes optional relevance indicators to help LLM prioritize sources
  */
 export function buildEnhancedUserPrompt(
   query: string,
-  sources: Array<{ cid: string; text: string; noteTitle?: string }>,
+  sources: EnhancedSource[],
   topicsHint?: string
 ): string {
+  // Sort sources by relevance if scores are available, keeping original order as fallback
+  const hasScores = sources.some(s => s.relevanceScore !== undefined);
+
   const sourcesText = sources
     .map(s => {
       const titlePrefix = s.noteTitle ? `(from "${s.noteTitle}") ` : '';
-      return `[${s.cid}]: ${titlePrefix}${s.text}`;
+      const relevanceHint = hasScores ? getRelevanceIndicator(s.relevanceScore) : '';
+      return `[${s.cid}]: ${relevanceHint}${titlePrefix}${s.text}`;
     })
     .join('\n\n');
 
@@ -182,9 +208,14 @@ export function buildEnhancedUserPrompt(
     ? `\nTopics: ${topicsHint}\n`
     : '';
 
+  // Add relevance hint if we have scores
+  const relevanceNote = hasScores
+    ? '\n(★ indicates higher relevance to your question)\n'
+    : '';
+
   return `${topicsSection}
 ## Your Notes (${sources.length} excerpts)
-
+${relevanceNote}
 ${sourcesText}
 
 ---
@@ -201,10 +232,11 @@ export function buildCompleteEnhancedPrompt(
   intent: QueryIntent,
   config: Partial<EnhancedPromptConfig> = {}
 ): { systemPrompt: string; userPrompt: string } {
-  // Build sources from chunks
-  const sources = chunks.map((chunk, index) => ({
+  // Build sources from chunks with relevance scores for quality hints
+  const sources: EnhancedSource[] = chunks.map((chunk, index) => ({
     cid: `N${index + 1}`,
     text: chunk.text,
+    relevanceScore: chunk.score,
     // noteTitle is not available on ScoredChunk, omit it
   }));
 
@@ -217,6 +249,9 @@ export function buildCompleteEnhancedPrompt(
     groundingLevel: config.groundingLevel || DEFAULT_CONFIG.groundingLevel,
     systemPromptLength: systemPrompt.length,
     userPromptLength: userPrompt.length,
+    avgRelevanceScore: chunks.length > 0
+      ? Math.round(chunks.reduce((sum, c) => sum + (c.score || 0), 0) / chunks.length * 100) / 100
+      : 0,
   });
 
   return { systemPrompt, userPrompt };

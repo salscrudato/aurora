@@ -23,19 +23,21 @@ describe('extractTermsForIndexing', () => {
     assert.ok(terms.includes('test'), 'Should include test');
   });
 
-  it('filters out short terms (< 2 chars)', () => {
-    const terms = extractTermsForIndexing('I am a test');
+  it('filters out short terms and stop words', () => {
+    const terms = extractTermsForIndexing('I am a test example');
     assert.ok(!terms.includes('i'), 'Should not include single char');
     assert.ok(!terms.includes('a'), 'Should not include single char');
-    assert.ok(terms.includes('am'), 'Should include 2-char word');
+    assert.ok(!terms.includes('am'), 'Should filter stop word "am"');
     assert.ok(terms.includes('test'), 'Should include longer word');
+    assert.ok(terms.includes('example'), 'Should include non-stop word');
   });
 
   it('handles special characters and punctuation', () => {
-    const terms = extractTermsForIndexing('Hello, world! How are you?');
+    const terms = extractTermsForIndexing('Hello, world! Testing example.');
     assert.ok(terms.includes('hello'), 'Should extract hello without comma');
     assert.ok(terms.includes('world'), 'Should extract world without exclamation');
-    assert.ok(terms.includes('how'), 'Should extract how');
+    assert.ok(terms.includes('testing'), 'Should extract testing');
+    assert.ok(terms.includes('example'), 'Should extract example');
   });
 
   it('handles camelCase and snake_case', () => {

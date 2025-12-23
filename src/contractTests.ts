@@ -617,6 +617,272 @@ describe('Contract: Citation Order by Appearance', () => {
   });
 });
 
+// ============================================
+// Thread Response Shape Contracts
+// ============================================
+
+/** Thread response shape */
+interface ThreadResponse {
+  id: string;
+  tenantId: string;
+  title?: string;
+  summary?: string;
+  messageCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Thread message shape */
+interface ThreadMessage {
+  id: string;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  createdAt: string;
+}
+
+/** Thread messages response shape */
+interface ThreadMessagesResponse {
+  messages: ThreadMessage[];
+  cursor: string | null;
+  hasMore: boolean;
+}
+
+function assertThreadShape(obj: unknown): asserts obj is ThreadResponse {
+  const thread = obj as Record<string, unknown>;
+  assert.strictEqual(typeof thread.id, 'string', 'thread.id should be string');
+  assert.strictEqual(typeof thread.tenantId, 'string', 'thread.tenantId should be string');
+  assert.ok(thread.title === undefined || typeof thread.title === 'string', 'thread.title should be string or undefined');
+  assert.ok(thread.summary === undefined || typeof thread.summary === 'string', 'thread.summary should be string or undefined');
+  assert.strictEqual(typeof thread.messageCount, 'number', 'thread.messageCount should be number');
+  assert.strictEqual(typeof thread.createdAt, 'string', 'thread.createdAt should be string');
+  assert.strictEqual(typeof thread.updatedAt, 'string', 'thread.updatedAt should be string');
+}
+
+function assertThreadMessageShape(obj: unknown): asserts obj is ThreadMessage {
+  const msg = obj as Record<string, unknown>;
+  assert.strictEqual(typeof msg.id, 'string', 'message.id should be string');
+  assert.ok(['user', 'assistant', 'system'].includes(msg.role as string), 'message.role should be user/assistant/system');
+  assert.strictEqual(typeof msg.content, 'string', 'message.content should be string');
+  assert.strictEqual(typeof msg.createdAt, 'string', 'message.createdAt should be string');
+}
+
+function assertThreadMessagesResponseShape(obj: unknown): asserts obj is ThreadMessagesResponse {
+  const response = obj as Record<string, unknown>;
+  assert.ok(Array.isArray(response.messages), 'messages should be array');
+  assert.ok(response.cursor === null || typeof response.cursor === 'string', 'cursor should be string or null');
+  assert.strictEqual(typeof response.hasMore, 'boolean', 'hasMore should be boolean');
+  if (Array.isArray(response.messages) && response.messages.length > 0) {
+    assertThreadMessageShape(response.messages[0]);
+  }
+}
+
+describe('Contract: Thread Response Shape', () => {
+  it('validates thread response shape', () => {
+    const thread = {
+      id: 'thread_abc123',
+      tenantId: 'user_123',
+      title: 'Test Thread',
+      summary: 'A test conversation',
+      messageCount: 5,
+      createdAt: '2024-01-15T10:00:00Z',
+      updatedAt: '2024-01-15T11:00:00Z',
+    };
+    assertThreadShape(thread);
+  });
+
+  it('validates thread without optional fields', () => {
+    const thread = {
+      id: 'thread_abc123',
+      tenantId: 'user_123',
+      messageCount: 0,
+      createdAt: '2024-01-15T10:00:00Z',
+      updatedAt: '2024-01-15T10:00:00Z',
+    };
+    assertThreadShape(thread);
+  });
+});
+
+describe('Contract: Thread Messages Response Shape', () => {
+  it('validates thread messages response', () => {
+    const response = {
+      messages: [
+        { id: 'msg_1', role: 'user', content: 'Hello', createdAt: '2024-01-15T10:00:00Z' },
+        { id: 'msg_2', role: 'assistant', content: 'Hi there!', createdAt: '2024-01-15T10:00:01Z' },
+      ],
+      cursor: 'cursor_abc',
+      hasMore: true,
+    };
+    assertThreadMessagesResponseShape(response);
+  });
+});
+
+// ============================================
+// Citation Offset Contracts
+// ============================================
+
+/** Citation with offset information */
+interface CitationWithOffset extends ChatCitation {
+  startOffset?: number;
+  endOffset?: number;
+  anchor?: string;
+}
+
+function assertCitationOffsetShape(obj: unknown): asserts obj is CitationWithOffset {
+  const citation = obj as Record<string, unknown>;
+  assertCitationShape(citation);
+  // Offsets are optional but if present must be numbers
+  if (citation.startOffset !== undefined) {
+    assert.strictEqual(typeof citation.startOffset, 'number', 'startOffset should be number');
+  }
+  if (citation.endOffset !== undefined) {
+    assert.strictEqual(typeof citation.endOffset, 'number', 'endOffset should be number');
+  }
+  if (citation.anchor !== undefined) {
+    assert.strictEqual(typeof citation.anchor, 'string', 'anchor should be string');
+  }
+}
+
+describe('Contract: Citation Offset Shape', () => {
+  it('validates citation with offsets', () => {
+    const citation = {
+      cid: 'N1',
+      noteId: 'note_abc',
+      chunkId: 'chunk_1',
+      createdAt: '2024-01-15',
+      snippet: 'Test snippet',
+      score: 0.95,
+      startOffset: 100,
+      endOffset: 200,
+      anchor: 'test-anchor',
+    };
+    assertCitationOffsetShape(citation);
+  });
+
+  it('validates citation without offsets (backwards compatible)', () => {
+    const citation = {
+      cid: 'N1',
+      noteId: 'note_abc',
+      chunkId: 'chunk_1',
+      createdAt: '2024-01-15',
+      snippet: 'Test snippet',
+      score: 0.95,
+    };
+    assertCitationOffsetShape(citation);
+  });
+});
+
+// ============================================
+// Enriched Note Contracts
+// ============================================
+
+/** Note with enrichment fields */
+interface EnrichedNoteResponse extends NoteResponse {
+  title?: string;
+  summary?: string;
+  noteType?: string;
+  actionItems?: Array<{ text: string; completed: boolean; dueDate?: string }>;
+  entities?: Array<{ name: string; type: string }>;
+  enrichmentStatus?: string;
+}
+
+function assertEnrichedNoteShape(obj: unknown): asserts obj is EnrichedNoteResponse {
+  assertNoteShape(obj);
+  const note = obj as unknown as Record<string, unknown>;
+
+  if (note.title !== undefined) {
+    assert.strictEqual(typeof note.title, 'string', 'title should be string');
+  }
+  if (note.summary !== undefined) {
+    assert.strictEqual(typeof note.summary, 'string', 'summary should be string');
+  }
+  if (note.noteType !== undefined) {
+    assert.strictEqual(typeof note.noteType, 'string', 'noteType should be string');
+  }
+  if (note.actionItems !== undefined) {
+    assert.ok(Array.isArray(note.actionItems), 'actionItems should be array');
+  }
+  if (note.entities !== undefined) {
+    assert.ok(Array.isArray(note.entities), 'entities should be array');
+  }
+  if (note.enrichmentStatus !== undefined) {
+    assert.strictEqual(typeof note.enrichmentStatus, 'string', 'enrichmentStatus should be string');
+  }
+}
+
+describe('Contract: Enriched Note Shape', () => {
+  it('validates enriched note with all fields', () => {
+    const note = {
+      id: 'note_abc',
+      text: 'Meeting notes from today',
+      tenantId: 'user_123',
+      createdAt: '2024-01-15T10:00:00Z',
+      updatedAt: '2024-01-15T10:00:00Z',
+      title: 'Team Meeting Notes',
+      summary: 'Discussion about Q1 goals',
+      noteType: 'meeting',
+      actionItems: [
+        { text: 'Follow up with John', completed: false, dueDate: '2024-01-20' },
+      ],
+      entities: [
+        { name: 'John', type: 'person' },
+        { name: 'Q1', type: 'date' },
+      ],
+      enrichmentStatus: 'completed',
+    };
+    assertEnrichedNoteShape(note);
+  });
+});
+
+// ============================================
+// Action Result Contracts
+// ============================================
+
+/** Action result shape */
+interface ActionResultResponse {
+  success: boolean;
+  action: string;
+  message: string;
+  requiresConfirmation?: boolean;
+  confirmationPrompt?: string;
+  data?: Record<string, unknown>;
+}
+
+function assertActionResultShape(obj: unknown): asserts obj is ActionResultResponse {
+  const result = obj as Record<string, unknown>;
+  assert.strictEqual(typeof result.success, 'boolean', 'success should be boolean');
+  assert.strictEqual(typeof result.action, 'string', 'action should be string');
+  assert.strictEqual(typeof result.message, 'string', 'message should be string');
+  if (result.requiresConfirmation !== undefined) {
+    assert.strictEqual(typeof result.requiresConfirmation, 'boolean', 'requiresConfirmation should be boolean');
+  }
+  if (result.confirmationPrompt !== undefined) {
+    assert.strictEqual(typeof result.confirmationPrompt, 'string', 'confirmationPrompt should be string');
+  }
+}
+
+describe('Contract: Action Result Shape', () => {
+  it('validates successful action result', () => {
+    const result = {
+      success: true,
+      action: 'create_note',
+      message: 'Note created successfully',
+      data: { createdNote: { id: 'note_abc' } },
+    };
+    assertActionResultShape(result);
+  });
+
+  it('validates action requiring confirmation', () => {
+    const result = {
+      success: false,
+      action: 'append_to_note',
+      message: 'Found note to update',
+      requiresConfirmation: true,
+      confirmationPrompt: 'Do you want to append to this note?',
+    };
+    assertActionResultShape(result);
+  });
+});
+
 // Export shape validators for use in integration tests
 export {
   assertHealthShape,
@@ -629,5 +895,12 @@ export {
   assertCitationShape,
   extractCitationIdsFromAnswer,
   getCitationIdsInAppearanceOrder,
+  // New exports
+  assertThreadShape,
+  assertThreadMessageShape,
+  assertThreadMessagesResponseShape,
+  assertCitationOffsetShape,
+  assertEnrichedNoteShape,
+  assertActionResultShape,
 };
 

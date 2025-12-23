@@ -19,6 +19,7 @@ import {
   CHUNKS_COLLECTION,
   RETRIEVAL_DEFAULT_DAYS,
   RETRIEVAL_MAX_CONTEXT_CHARS,
+  RETRIEVAL_MIN_RELEVANCE,
   LLM_CONTEXT_BUDGET_CHARS,
   LLM_CONTEXT_RESERVE_CHARS,
   VECTOR_SEARCH_ENABLED,
@@ -56,6 +57,17 @@ const MIN_VECTOR_SCORE = 0.15;     // Lower threshold for recall-first (was 0.20
 const MIN_COMBINED_SCORE = 0.05;   // Lower for better recall (was 0.08)
 const DIVERSITY_PENALTY = 0.10;    // Penalty for over-represented notes
 const MAX_CHUNKS_PER_NOTE = 4;     // Max chunks from single note before diversity penalty
+
+// Precision boost thresholds - when top results are very strong, filter more aggressively
+const PRECISION_BOOST_TOP_SCORE_THRESHOLD = 0.70;  // If top chunk scores above this (lowered from 0.75)
+const PRECISION_BOOST_GAP_THRESHOLD = 0.25;        // And gap to 5th chunk is above this (lowered from 0.30)
+const PRECISION_BOOST_MIN_SCORE = 0.25;            // Then raise min score to this (raised from 0.20)
+
+// Score gap detection thresholds - filter out sources with large score drop-off
+// This prevents including low-relevance "trailing" sources that dilute precision
+const SCORE_GAP_THRESHOLD = 0.35;      // If consecutive gap is larger than this, truncate
+const SCORE_GAP_MIN_TOP_SCORE = 0.60;  // Only apply gap detection if top score is strong
+const SCORE_GAP_MIN_RETAIN = 2;        // Always keep at least this many results
 
 // Batch hydration configuration
 const BATCH_HYDRATION_MAX = 500;   // Max chunks to hydrate from vector results (configurable cap)
@@ -1143,6 +1155,45 @@ export function applyMMRReranking(
 }
 
 /**
+ * Fast text deduplication to remove near-identical chunks after reranking.
+ * This is a lightweight pass that catches duplicates that may have been
+ * reordered by cross-encoder or LLM reranking.
+ */
+function deduplicateByText(chunks: ScoredChunk[], threshold: number = TEXT_DEDUP_THRESHOLD): ScoredChunk[] {
+  if (chunks.length <= 1) return chunks;
+
+  const result: ScoredChunk[] = [];
+  const selectedTexts: string[] = [];
+
+  for (const chunk of chunks) {
+    // Check if this chunk's text is too similar to any already selected chunk
+    let isDuplicate = false;
+    for (const selectedText of selectedTexts) {
+      const similarity = textSimilarity(chunk.text, selectedText);
+      if (similarity >= threshold) {
+        isDuplicate = true;
+        break;
+      }
+    }
+
+    if (!isDuplicate) {
+      result.push(chunk);
+      selectedTexts.push(chunk.text);
+    }
+  }
+
+  if (result.length < chunks.length) {
+    logInfo('Post-rerank text deduplication applied', {
+      inputCount: chunks.length,
+      outputCount: result.length,
+      duplicatesRemoved: chunks.length - result.length,
+    });
+  }
+
+  return result;
+}
+
+/**
  * Apply diversity reranking to avoid too many chunks from the same note
  * while still allowing sufficient context from relevant notes
  * (Fallback when MMR is disabled)
@@ -1303,6 +1354,56 @@ function applyCoverageReranking(
   // Re-sort by score for final ordering
   selected.sort((a, b) => b.score - a.score);
   return selected;
+}
+
+/**
+ * Apply score gap detection to filter out trailing low-relevance sources
+ *
+ * When there's a significant score drop-off between consecutive results,
+ * we truncate the list to avoid including irrelevant "noise" sources that
+ * dilute precision. This is especially important for focused queries where
+ * we have strong top results but weaker trailing matches.
+ *
+ * @param chunks - Sorted chunks (highest score first)
+ * @returns Filtered chunks up to the score gap cutoff
+ */
+function applyScoreGapDetection(chunks: ScoredChunk[]): { chunks: ScoredChunk[]; gapFound: boolean; cutoffIndex?: number } {
+  if (chunks.length <= SCORE_GAP_MIN_RETAIN) {
+    return { chunks, gapFound: false };
+  }
+
+  const topScore = chunks[0]?.score ?? 0;
+
+  // Only apply gap detection if top result is strong enough
+  if (topScore < SCORE_GAP_MIN_TOP_SCORE) {
+    return { chunks, gapFound: false };
+  }
+
+  // Look for significant score gaps between consecutive results
+  for (let i = SCORE_GAP_MIN_RETAIN - 1; i < chunks.length - 1; i++) {
+    const currentScore = chunks[i].score;
+    const nextScore = chunks[i + 1].score;
+    const gap = currentScore - nextScore;
+
+    // If we find a large gap, truncate here
+    if (gap >= SCORE_GAP_THRESHOLD) {
+      logInfo('Score gap detection triggered', {
+        cutoffIndex: i + 1,
+        currentScore: Math.round(currentScore * 100) / 100,
+        nextScore: Math.round(nextScore * 100) / 100,
+        gap: Math.round(gap * 100) / 100,
+        originalCount: chunks.length,
+        newCount: i + 1,
+      });
+      return {
+        chunks: chunks.slice(0, i + 1),
+        gapFound: true,
+        cutoffIndex: i + 1
+      };
+    }
+  }
+
+  return { chunks, gapFound: false };
 }
 
 /**
@@ -1622,6 +1723,20 @@ export async function retrieveRelevantChunks(
     }
   }
 
+  // For aggregation intents (summarize, list), use recency chunks as fallback
+  // when vector/lexical search finds no results
+  if (mergedChunks.length === 0 && recencyChunks.length > 0 && isAggregationIntent) {
+    logInfo('Using recency fallback for aggregation intent with no keyword matches', {
+      intent: analysis.intent,
+      recencyChunkCount: recencyChunks.length,
+      query: query.slice(0, 50),
+    });
+    mergedChunks = recencyChunks;
+    // Mark all as recency-sourced
+    sources = new Map(recencyChunks.map(c => [c.chunkId, new Set(['recency'] as const)]));
+    strategy += '_recency_fallback';
+  }
+
   if (mergedChunks.length === 0) {
     return {
       chunks: [],
@@ -1659,11 +1774,31 @@ export async function retrieveRelevantChunks(
 
   timings.scoringMs = Date.now() - scoringStart;
 
-  // Filter out very low quality results
-  scored = scored.filter(chunk => chunk.score >= MIN_COMBINED_SCORE);
-
-  // Sort by combined score
+  // Sort by combined score first to enable precision boost analysis
   scored.sort((a, b) => b.score - a.score);
+
+  // Apply precision boost: when top results are very strong, filter more aggressively
+  // This improves precision without sacrificing recall for focused queries
+  let effectiveMinScore = MIN_COMBINED_SCORE;
+  if (scored.length >= 5) {
+    const topScore = scored[0]?.score || 0;
+    const fifthScore = scored[4]?.score || 0;
+    const scoreGap = topScore - fifthScore;
+
+    if (topScore >= PRECISION_BOOST_TOP_SCORE_THRESHOLD && scoreGap >= PRECISION_BOOST_GAP_THRESHOLD) {
+      effectiveMinScore = PRECISION_BOOST_MIN_SCORE;
+      strategy += '_precboost';
+      logInfo('Precision boost applied', {
+        topScore: Math.round(topScore * 100) / 100,
+        fifthScore: Math.round(fifthScore * 100) / 100,
+        scoreGap: Math.round(scoreGap * 100) / 100,
+        newMinScore: effectiveMinScore,
+      });
+    }
+  }
+
+  // Filter out low quality results with effective threshold
+  scored = scored.filter(chunk => chunk.score >= effectiveMinScore);
 
   // Stage 5: Reranking
   const rerankStart = Date.now();
@@ -1708,6 +1843,40 @@ export async function retrieveRelevantChunks(
     } catch (err) {
       logError('LLM rerank failed, using heuristic order', err);
     }
+  }
+
+  // Apply post-rerank text deduplication to catch any duplicates that
+  // were reordered by cross-encoder or LLM reranking
+  if (scored.length > 1) {
+    scored = deduplicateByText(scored);
+    strategy += '_dedup';
+  }
+
+  // Apply score gap detection to filter out trailing low-relevance sources
+  // Only for non-aggregation intents (aggregation needs broader coverage)
+  if (!isAggregationIntent && scored.length > SCORE_GAP_MIN_RETAIN) {
+    const gapResult = applyScoreGapDetection(scored);
+    if (gapResult.gapFound) {
+      scored = gapResult.chunks;
+      strategy += '_scoregap';
+    }
+  }
+
+  // Filter out chunks below minimum relevance threshold
+  // This ensures only high-quality matches are included in context
+  // Use lower threshold for aggregation intents to include more diverse sources
+  const relevanceThreshold = isAggregationIntent
+    ? Math.min(RETRIEVAL_MIN_RELEVANCE, 0.10) // Lower threshold for summarize/list
+    : RETRIEVAL_MIN_RELEVANCE;
+  const preFilterCount = scored.length;
+  scored = scored.filter(chunk => chunk.score >= relevanceThreshold);
+  if (scored.length < preFilterCount) {
+    logInfo('Low relevance chunks filtered', {
+      beforeCount: preFilterCount,
+      afterCount: scored.length,
+      threshold: relevanceThreshold,
+      isAggregation: isAggregationIntent,
+    });
   }
 
   // Trim to final count

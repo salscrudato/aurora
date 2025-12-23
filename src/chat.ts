@@ -47,6 +47,7 @@ import { extractClaimCitationPairs, batchScoreCitations, filterByConfidence, agg
 // New enhanced modules for improved citation accuracy
 import { runUnifiedCitationPipeline, quickVerifyCitation, analyzeContradiction } from "./unifiedCitationPipeline";
 import { buildEnhancedSystemPrompt, buildCompleteEnhancedPrompt } from "./enhancedPrompts";
+import { buildCompleteAgenticPrompt, ResponseFormat } from "./agenticPrompts";
 import { computeSemanticAnchors, buildSourceAnchorHints } from "./claimExtraction";
 
 // Additional enhancement modules for response consistency and citation accuracy
@@ -77,6 +78,7 @@ const MIN_CITATION_COVERAGE_STRICT = 0.6; // Warn if < 60% coverage after repair
 const UNIFIED_PIPELINE_ENABLED = true;    // Use new unified citation verification pipeline
 const CONSISTENCY_ENFORCEMENT_ENABLED = true;  // Enforce response consistency
 const ENHANCED_PROMPTS_ENABLED = true;     // Use optimized v2 prompts (conversational, concise)
+const AGENTIC_PROMPTS_ENABLED = true;      // Use new agentic prompt framework (overrides ENHANCED_PROMPTS)
 
 // NOTE: MIN_CITATION_SCORE filtering is now done in retrieval (MIN_COMBINED_SCORE)
 // to ensure prompt source count == citationsMap.size EXACTLY.
@@ -283,14 +285,19 @@ export function buildSourcesPack(chunks: ScoredChunk[], queryTerms: string[] = [
   for (let i = 0; i < chunkCount; i++) {
     const chunk = chunks[i];
     const cid = `N${i + 1}`;
-    citationsMap.set(cid, {
+    const citation: Citation = {
       cid,
       noteId: chunk.noteId,
       chunkId: chunk.chunkId,
       createdAt: chunk.createdAt.toISOString(),
       snippet: extractBestSnippet(chunk.text, 250, queryTerms),
       score: Math.round(chunk.score * 100) / 100,
-    });
+    };
+    // Include offset information for precise citation anchoring (if available)
+    if (chunk.startOffset !== undefined) citation.startOffset = chunk.startOffset;
+    if (chunk.endOffset !== undefined) citation.endOffset = chunk.endOffset;
+    if (chunk.anchor) citation.anchor = chunk.anchor;
+    citationsMap.set(cid, citation);
   }
 
   return {
@@ -328,17 +335,24 @@ function extractTopicsFromChunks(chunks: ScoredChunk[]): string[] {
  * Convert citations to human-readable Source objects for the new response format
  */
 function citationsToSources(citations: Citation[]): Source[] {
-  return citations.map(c => ({
-    id: c.cid.replace('N', ''),
-    noteId: c.noteId,
-    preview: c.snippet.length > 120 ? c.snippet.slice(0, 117) + '...' : c.snippet,
-    date: new Date(c.createdAt).toLocaleDateString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric',
-    }),
-    relevance: Math.round(c.score * 100) / 100,
-  }));
+  return citations.map(c => {
+    const source: Source = {
+      id: c.cid.replace('N', ''),
+      noteId: c.noteId,
+      preview: c.snippet.length > 120 ? c.snippet.slice(0, 117) + '...' : c.snippet,
+      date: new Date(c.createdAt).toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      }),
+      relevance: Math.round(c.score * 100) / 100,
+    };
+    // Include offset information for precise citation anchoring (if available)
+    if (c.startOffset !== undefined) source.startOffset = c.startOffset;
+    if (c.endOffset !== undefined) source.endOffset = c.endOffset;
+    if (c.anchor) source.anchor = c.anchor;
+    return source;
+  });
 }
 
 /**
@@ -352,9 +366,9 @@ function citationsToSources(citations: Citation[]): Source[] {
  * @returns Array of Source objects for uncited context sources
  */
 // Minimum relevance threshold for context sources (filter out noise)
-// Increased to 0.30 to avoid showing irrelevant context for out-of-scope queries
-const CONTEXT_SOURCE_MIN_RELEVANCE = 0.30;
-const CONTEXT_SOURCE_MAX_COUNT = 5;  // Reduced for cleaner responses
+// Increased to 0.40 to avoid showing irrelevant context that dilutes precision
+const CONTEXT_SOURCE_MIN_RELEVANCE = 0.40;
+const CONTEXT_SOURCE_MAX_COUNT = 4;  // Reduced for cleaner, more focused responses
 
 function buildContextSources(
   allChunks: ScoredChunk[],
@@ -741,11 +755,28 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
   const { citationsMap, sourceCount } = sourcesPack;
 
   // Build prompt with intent-aware instructions using SourcesPack
-  // Use enhanced prompts (v2) when flag is enabled, otherwise use legacy prompts
+  // Priority: Agentic prompts > Enhanced prompts (v2) > Legacy prompts
   let prompt: string;
   let systemInstruction: string | undefined;
+  let responseFormat: ResponseFormat | undefined;
 
-  if (ENHANCED_PROMPTS_ENABLED) {
+  if (AGENTIC_PROMPTS_ENABLED) {
+    // Agentic prompts: intelligent response generation with format optimization
+    const agenticResult = buildCompleteAgenticPrompt(
+      query,
+      chunks,
+      queryAnalysis.intent
+    );
+    systemInstruction = agenticResult.systemPrompt;
+    prompt = agenticResult.userPrompt;
+    responseFormat = agenticResult.format;
+
+    logInfo('Using agentic prompt framework', {
+      intent: queryAnalysis.intent,
+      format: responseFormat,
+      sourceCount,
+    });
+  } else if (ENHANCED_PROMPTS_ENABLED) {
     // Enhanced v2 prompts: separate system instruction + user prompt
     const { systemPrompt, userPrompt } = buildCompleteEnhancedPrompt(
       query,
@@ -1367,6 +1398,291 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
     },
     // Backwards compatibility
     citations: usedCitations,
+  };
+}
+
+// ============================================================================
+// Enhanced Chat Interface (for new API schema)
+// ============================================================================
+
+/** Conversation message for multi-turn context */
+export interface ConversationMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+/** Note filters for scoped retrieval */
+export interface ChatNoteFilters {
+  noteIds?: string[];
+  excludeNoteIds?: string[];
+  tags?: string[];
+  dateFrom?: string;
+  dateTo?: string;
+}
+
+/** Response format options */
+export type ResponseFormatType = 'default' | 'concise' | 'detailed' | 'bullet' | 'structured';
+
+/** Enhanced chat options */
+export interface EnhancedChatOptions {
+  temperature?: number;
+  maxTokens?: number;
+  topK?: number;
+  minRelevance?: number;
+  includeSources?: boolean;
+  includeContextSources?: boolean;
+  verifyCitations?: boolean;
+  responseFormat?: ResponseFormatType;
+  systemPrompt?: string;
+  language?: string;
+}
+
+/** Enhanced chat request */
+export interface EnhancedChatRequest {
+  query: string;
+  tenantId: string;
+  threadId?: string;
+  conversationHistory?: ConversationMessage[];
+  filters?: ChatNoteFilters;
+  options?: EnhancedChatOptions;
+  saveToThread?: boolean;
+}
+
+/** Build conversation context string from history */
+export function buildConversationContext(history: ConversationMessage[], maxMessages: number = 10): string {
+  if (!history || history.length === 0) return '';
+
+  // Take last N messages
+  const recentHistory = history.slice(-maxMessages);
+
+  const parts = recentHistory.map(msg => {
+    const role = msg.role === 'user' ? 'User' : 'Assistant';
+    return `${role}: ${msg.content}`;
+  });
+
+  return `\n--- Conversation History ---\n${parts.join('\n\n')}\n--- End History ---\n\n`;
+}
+
+/** Get response format instructions */
+function getResponseFormatInstructions(format: ResponseFormatType = 'default'): string {
+  switch (format) {
+    case 'concise':
+      return 'Be concise - aim for 2-3 sentences maximum. Get straight to the point.';
+    case 'detailed':
+      return 'Provide a comprehensive answer with full context and explanations.';
+    case 'bullet':
+      return 'Format your response as a bulleted list with clear, actionable points.';
+    case 'structured':
+      return 'Use markdown formatting with headers, bullet points, and emphasis where appropriate.';
+    case 'default':
+    default:
+      return 'Respond naturally and conversationally.';
+  }
+}
+
+/**
+ * Generate enhanced chat response with conversation context, filters, and format options
+ */
+export async function generateEnhancedChatResponse(request: EnhancedChatRequest): Promise<ChatResponse> {
+  const startTime = Date.now();
+
+  // Check GenAI availability early
+  if (!isGenAIAvailable()) {
+    throw new ConfigurationError('Chat service is not configured. Set GOOGLE_API_KEY/GEMINI_API_KEY or configure Vertex AI.');
+  }
+
+  const { query, tenantId, conversationHistory, filters, options = {} } = request;
+  const {
+    temperature = CHAT_TEMPERATURE,
+    maxTokens = LLM_MAX_OUTPUT_TOKENS,
+    topK = RETRIEVAL_TOP_K,
+    minRelevance,
+    includeSources = true,
+    includeContextSources = false,
+    verifyCitations = true,
+    responseFormat = 'default',
+    systemPrompt,
+    language,
+  } = options;
+
+  // Sanitize and validate input
+  const sanitizedQuery = sanitizeText(query, CHAT_MAX_QUERY_LENGTH + 100).trim();
+
+  if (!sanitizedQuery) {
+    throw new Error('query is required');
+  }
+
+  if (sanitizedQuery.length > CHAT_MAX_QUERY_LENGTH) {
+    throw new Error(`query too long (max ${CHAT_MAX_QUERY_LENGTH} chars)`);
+  }
+
+  if (!isValidTenantId(tenantId)) {
+    throw new Error('invalid tenantId format');
+  }
+
+  // Initialize retrieval log
+  const retrievalLog = createRetrievalLog(tenantId, sanitizedQuery) as RetrievalLogEntry;
+
+  // Analyze query for intent and keywords
+  const queryAnalysis = analyzeQuery(sanitizedQuery);
+
+  // Calculate adaptive K
+  const adaptiveK = calculateAdaptiveK(sanitizedQuery, queryAnalysis.intent, queryAnalysis.keywords);
+  const rerankTo = Math.min(adaptiveK * 3, maxTokens > 2000 ? 20 : 15);
+
+  // Build note filters for retrieval
+  const noteFilters = filters ? {
+    noteIds: filters.noteIds,
+    excludeNoteIds: filters.excludeNoteIds,
+    tags: filters.tags,
+    dateFrom: filters.dateFrom ? new Date(filters.dateFrom) : undefined,
+    dateTo: filters.dateTo ? new Date(filters.dateTo) : undefined,
+  } : undefined;
+
+  // Retrieve relevant chunks with filters
+  const retrievalStart = Date.now();
+  const contextBudget = LLM_CONTEXT_BUDGET_CHARS - LLM_CONTEXT_RESERVE_CHARS;
+
+  let { chunks, strategy, candidateCount } = await retrieveRelevantChunks(sanitizedQuery, {
+    tenantId,
+    topK,
+    rerankTo,
+    contextBudget,
+    noteFilters,
+    minRelevance,
+  });
+
+  const retrievalMs = Date.now() - retrievalStart;
+
+  // Handle no results
+  if (chunks.length === 0) {
+    const noResultsMessage = filters
+      ? "I couldn't find any relevant notes matching your filters. Try broadening your search or adjusting the filters."
+      : "I don't have any notes to search through. Try creating some notes first!";
+
+    return {
+      answer: noResultsMessage,
+      sources: [],
+      meta: {
+        model: CHAT_MODEL,
+        requestId: retrievalLog.requestId,
+        responseTimeMs: Date.now() - startTime,
+        intent: queryAnalysis.intent,
+        confidence: 'none',
+        sourceCount: 0,
+      },
+    };
+  }
+
+  // Build sources pack
+  const queryTerms = queryAnalysis.keywords || [];
+  const sourcesPack = buildSourcesPack(chunks, queryTerms);
+
+  // Build the conversation context if provided
+  const conversationContext = conversationHistory
+    ? buildConversationContext(conversationHistory)
+    : '';
+
+  // Build response format instructions
+  const formatInstructions = getResponseFormatInstructions(responseFormat);
+
+  // Build enhanced prompt with context
+  let prompt: string;
+  if (systemPrompt) {
+    // Use custom system prompt
+    prompt = systemPrompt + '\n\n' + conversationContext +
+      `SOURCES (${sourcesPack.sourceCount}):\n` +
+      Array.from(sourcesPack.citationsMap.entries())
+        .map(([cid, c]) => `[${cid}] ${c.snippet}`)
+        .join('\n\n') +
+      `\n\nQuestion: ${sanitizedQuery}\n\nAnswer:`;
+  } else {
+    // Use standard prompt building with enhancements
+    const basePrompt = buildPrompt(sanitizedQuery, sourcesPack, queryAnalysis.intent);
+    const languageHint = language ? `\nRespond in ${language}.` : '';
+    prompt = conversationContext + formatInstructions + languageHint + '\n\n' + basePrompt;
+  }
+
+  // Generate LLM response
+  const genStart = Date.now();
+  const client = getGenAIClient();
+
+  let answer: string;
+  try {
+    const response = await withLLMRetry(
+      async () => client.models.generateContent({
+        model: CHAT_MODEL,
+        contents: [{ parts: [{ text: prompt }] }],
+        config: {
+          temperature,
+          topP: CHAT_TOP_P,
+          topK: CHAT_TOP_K,
+          maxOutputTokens: maxTokens,
+        },
+      }),
+      'generateEnhancedChatResponse'
+    );
+    answer = response.text?.trim() || '';
+  } catch (error) {
+    logError('LLM generation failed', error);
+    throw error;
+  }
+
+  const generationMs = Date.now() - genStart;
+
+  // Extract and validate citations
+  const allCitations = Array.from(sourcesPack.citationsMap.values());
+  let validCitations = allCitations;
+  let invalidRemoved = 0;
+
+  if (verifyCitations) {
+    const validation = validateCitationsWithChunks(answer, allCitations, chunks);
+    validCitations = validation.validatedCitations;
+    invalidRemoved = validation.invalidCitationsRemoved.length;
+  }
+
+  // Build sources for response
+  const sources = includeSources ? citationsToSources(validCitations) : [];
+
+  // Build context sources if requested
+  const citedChunkIds = new Set(validCitations.map(c => c.chunkId));
+  const contextSources = includeContextSources
+    ? buildContextSources(chunks, citedChunkIds, validCitations.length + 1, queryTerms)
+    : undefined;
+
+  // Calculate confidence using existing function
+  const confidenceBreakdown = calculateResponseConfidence(answer, validCitations, chunks, queryAnalysis.intent);
+  const confidence = confidenceBreakdown.confidenceLevel as ConfidenceLevel;
+
+  // Log the request
+  logInfo('Enhanced chat response generated', {
+    requestId: retrievalLog.requestId,
+    tenantId,
+    hasConversationHistory: !!conversationHistory,
+    hasFilters: !!filters,
+    responseFormat,
+    sourceCount: sources.length,
+    retrievalMs,
+    generationMs,
+  });
+
+  return {
+    answer,
+    sources,
+    contextSources,
+    meta: {
+      model: CHAT_MODEL,
+      requestId: retrievalLog.requestId,
+      responseTimeMs: Date.now() - startTime,
+      intent: queryAnalysis.intent,
+      confidence,
+      sourceCount: sources.length,
+      retrieval: {
+        strategy,
+        candidateCount,
+        k: rerankTo,
+      },
+    },
   };
 }
 

@@ -13,6 +13,7 @@ import {
   ThreadResponse,
   ThreadDetailResponse,
   ThreadsListResponse,
+  ThreadMessagesResponse,
   ThreadMessage,
   MessageRole,
   Source,
@@ -36,6 +37,7 @@ function docToResponse(doc: ThreadDoc): ThreadResponse {
     id: doc.id,
     tenantId: doc.tenantId,
     title: doc.title,
+    summary: doc.summary,
     messageCount: doc.messages.length,
     lastActivityAt: timestampToISO(doc.lastActivityAt),
     createdAt: timestampToISO(doc.createdAt),
@@ -258,5 +260,102 @@ export async function getRecentMessages(
     sources: m.sources,
     createdAt: FieldValue.serverTimestamp(), // Placeholder, actual value from thread
   }));
+}
+
+/**
+ * Update a thread's metadata (title, summary)
+ */
+export async function updateThread(
+  threadId: string,
+  tenantId: string,
+  updates: { title?: string; summary?: string }
+): Promise<ThreadResponse | null> {
+  const db = getDb();
+  const threadRef = db.collection(THREADS_COLLECTION).doc(threadId);
+
+  const threadDoc = await threadRef.get();
+  if (!threadDoc.exists) return null;
+
+  const threadData = threadDoc.data() as ThreadDoc;
+  if (threadData.tenantId !== tenantId) return null;
+
+  const updateData: Record<string, unknown> = {
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+
+  if (updates.title !== undefined) {
+    updateData.title = updates.title;
+  }
+  if (updates.summary !== undefined) {
+    updateData.summary = updates.summary;
+  }
+
+  await threadRef.update(updateData);
+
+  logInfo('Thread updated', { threadId, tenantId, updates: Object.keys(updates) });
+
+  // Fetch updated document
+  const updatedDoc = await threadRef.get();
+  return docToResponse(updatedDoc.data() as ThreadDoc);
+}
+
+/**
+ * Get paginated messages from a thread
+ * Uses cursor-based pagination with message index
+ */
+export async function getThreadMessages(
+  threadId: string,
+  tenantId: string,
+  options: { limit?: number; cursor?: string; order?: 'asc' | 'desc' } = {}
+): Promise<ThreadMessagesResponse | null> {
+  const { limit = 20, cursor, order = 'desc' } = options;
+
+  const thread = await getThread(threadId, tenantId);
+  if (!thread) return null;
+
+  const messages = thread.messages;
+  const totalCount = messages.length;
+
+  // Parse cursor (message index)
+  let startIndex = order === 'desc' ? messages.length - 1 : 0;
+  if (cursor) {
+    const cursorIndex = parseInt(cursor, 10);
+    if (!isNaN(cursorIndex)) {
+      startIndex = cursorIndex;
+    }
+  }
+
+  // Get messages based on order
+  let resultMessages: typeof messages;
+  let nextCursor: string | null = null;
+
+  if (order === 'desc') {
+    // Newest first
+    const endIndex = Math.max(0, startIndex - limit + 1);
+    resultMessages = messages.slice(endIndex, startIndex + 1).reverse();
+    if (endIndex > 0) {
+      nextCursor = String(endIndex - 1);
+    }
+  } else {
+    // Oldest first
+    const endIndex = Math.min(messages.length, startIndex + limit);
+    resultMessages = messages.slice(startIndex, endIndex);
+    if (endIndex < messages.length) {
+      nextCursor = String(endIndex);
+    }
+  }
+
+  return {
+    messages: resultMessages.map((m) => ({
+      id: m.id,
+      role: m.role as MessageRole,
+      content: m.content,
+      sources: m.sources,
+      createdAt: timestampToISO(m.createdAt),
+    })),
+    cursor: nextCursor,
+    hasMore: nextCursor !== null,
+    totalCount,
+  };
 }
 

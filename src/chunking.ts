@@ -48,10 +48,19 @@ function splitIntoSemanticUnits(text: string): string[] {
   return units;
 }
 
+/** Chunk with offset information for precise citation anchoring */
+export interface ChunkWithOffset {
+  text: string;
+  startOffset: number;
+  endOffset: number;
+  anchor: string;
+}
+
 /**
  * Split text into chunks using improved semantic boundary detection
+ * Returns chunks with character offset information for citation precision
  */
-export function splitIntoChunks(text: string): string[] {
+export function splitIntoChunksWithOffsets(text: string): ChunkWithOffset[] {
   const normalizedText = text.replace(/\r\n/g, '\n').trim();
 
   // Empty text: return nothing
@@ -61,8 +70,66 @@ export function splitIntoChunks(text: string): string[] {
 
   // Short text: return as single chunk (always index short notes for retrieval)
   if (normalizedText.length <= CHUNK_MAX_SIZE) {
-    return [normalizedText];
+    return [{
+      text: normalizedText,
+      startOffset: 0,
+      endOffset: normalizedText.length,
+      anchor: normalizedText.slice(0, 50),
+    }];
   }
+
+  // For longer text, we need to track offsets as we split
+  const chunks = splitIntoChunksInternal(normalizedText);
+  return calculateOffsets(normalizedText, chunks);
+}
+
+/**
+ * Legacy function for backward compatibility
+ */
+export function splitIntoChunks(text: string): string[] {
+  return splitIntoChunksWithOffsets(text).map(c => c.text);
+}
+
+/**
+ * Calculate character offsets for chunks by finding them in the original text
+ */
+function calculateOffsets(originalText: string, chunks: string[]): ChunkWithOffset[] {
+  const result: ChunkWithOffset[] = [];
+  let searchStart = 0;
+
+  for (const chunk of chunks) {
+    // Find the chunk in the original text, starting from where we left off
+    // Handle overlap by looking for the unique part of the chunk
+    const chunkStart = originalText.indexOf(chunk.slice(0, 100), searchStart);
+
+    if (chunkStart >= 0) {
+      result.push({
+        text: chunk,
+        startOffset: chunkStart,
+        endOffset: chunkStart + chunk.length,
+        anchor: chunk.slice(0, 50),
+      });
+      // Move search start forward, but allow some overlap
+      searchStart = chunkStart + Math.max(1, chunk.length - 100);
+    } else {
+      // Fallback: use approximate position
+      result.push({
+        text: chunk,
+        startOffset: searchStart,
+        endOffset: searchStart + chunk.length,
+        anchor: chunk.slice(0, 50),
+      });
+      searchStart += chunk.length;
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Internal function that does the actual splitting
+ */
+function splitIntoChunksInternal(normalizedText: string): string[] {
 
   const units = splitIntoSemanticUnits(normalizedText);
   const chunks: string[] = [];
@@ -329,38 +396,42 @@ export async function processNoteChunks(note: NoteDoc): Promise<void> {
       });
     }
 
-    // Split note into chunks
-    const textChunks = splitIntoChunks(note.text);
+    // Split note into chunks with offset information
+    const chunksWithOffsets = splitIntoChunksWithOffsets(note.text);
 
-    if (textChunks.length === 0) {
+    if (chunksWithOffsets.length === 0) {
       logInfo('Note too short for chunking', { noteId: note.id });
       return;
     }
 
-    // Create chunk documents with terms for lexical indexing and context windows
+    // Create chunk documents with terms for lexical indexing, context windows, and offsets
     const CONTEXT_WINDOW_SIZE = 100; // chars of context from prev/next chunk
-    const chunks: ChunkDoc[] = textChunks.map((text, position) => {
+    const chunks: ChunkDoc[] = chunksWithOffsets.map((chunkData, position) => {
       // Extract context from adjacent chunks for citation accuracy
       const prevContext = position > 0
-        ? textChunks[position - 1].slice(-CONTEXT_WINDOW_SIZE)
+        ? chunksWithOffsets[position - 1].text.slice(-CONTEXT_WINDOW_SIZE)
         : null;  // Use null instead of undefined for Firestore compatibility
-      const nextContext = position < textChunks.length - 1
-        ? textChunks[position + 1].slice(0, CONTEXT_WINDOW_SIZE)
+      const nextContext = position < chunksWithOffsets.length - 1
+        ? chunksWithOffsets[position + 1].text.slice(0, CONTEXT_WINDOW_SIZE)
         : null;  // Use null instead of undefined for Firestore compatibility
 
       const chunk: ChunkDoc = {
         chunkId: `${note.id}_${String(position).padStart(3, '0')}`,
         noteId: note.id,
         tenantId: note.tenantId,
-        text,
-        textHash: hashText(text),
+        text: chunkData.text,
+        textHash: hashText(chunkData.text),
         position,
-        tokenEstimate: estimateTokens(text),
+        tokenEstimate: estimateTokens(chunkData.text),
         createdAt: note.createdAt,
         // Lexical indexing fields
-        terms: extractTermsForIndexing(text),
+        terms: extractTermsForIndexing(chunkData.text),
         termsVersion: TERMS_VERSION,
-        totalChunks: textChunks.length,
+        totalChunks: chunksWithOffsets.length,
+        // Character offsets for precise citation anchoring
+        startOffset: chunkData.startOffset,
+        endOffset: chunkData.endOffset,
+        anchor: chunkData.anchor,
       };
 
       // Only add context fields if they have values (Firestore doesn't accept undefined)
@@ -373,6 +444,7 @@ export async function processNoteChunks(note: NoteDoc): Promise<void> {
     // Generate embeddings if enabled
     if (EMBEDDINGS_ENABLED) {
       try {
+        const textChunks = chunksWithOffsets.map(c => c.text);
         const embeddings = await generateEmbeddings(textChunks);
         // generateEmbeddings now guarantees embeddings.length === textChunks.length
         // or throws EmbeddingError. Safe to iterate 1:1.

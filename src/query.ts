@@ -25,16 +25,17 @@ const INTENT_PATTERNS: { pattern: RegExp; intent: QueryIntent }[] = [
   { pattern: /\bwhat did (I|we) decide\b/i, intent: 'decision' },
   { pattern: /\b(reasoning|rationale) (behind|for)\b/i, intent: 'decision' },
 
-  // Action item patterns
-  { pattern: /\b(todo|to-do|action item|task|next step|follow[- ]?up)\b/i, intent: 'action_item' },
+  // Action item patterns (support plurals and common variations)
+  { pattern: /\b(todos?|to-dos?|action items?|tasks?|next steps?|follow[- ]?ups?)\b/i, intent: 'action_item' },
   { pattern: /\bwhat (do I|should I|need to|must I) (do|complete|finish|work on)\b/i, intent: 'action_item' },
-  { pattern: /\bpending (task|item|work)\b/i, intent: 'action_item' },
-  { pattern: /\bremind(er)?\b/i, intent: 'action_item' },
+  { pattern: /\bpending (tasks?|items?|work)\b/i, intent: 'action_item' },
+  { pattern: /\bremind(er)?s?\b/i, intent: 'action_item' },
+  { pattern: /\b(outstanding|incomplete|open) (items?|tasks?)\b/i, intent: 'action_item' },
 
-  // List patterns
+  // List patterns (must come after action_item since "what are my todos" should match action_item)
   { pattern: /\b(list|show me|give me|enumerate|all the)\b/i, intent: 'list' },
   { pattern: /\bhow many\b/i, intent: 'list' },
-  { pattern: /\bwhat are (all|the)\b/i, intent: 'list' },
+  { pattern: /\bwhat are (all|the) (?!.*\b(todos?|action items?|tasks?)\b)/i, intent: 'list' },
 
   // Question patterns (generic - lowest priority)
   { pattern: /^(what|who|when|where|why|how|which|is|are|was|were|do|does|did|can|could|will|would)\b/i, intent: 'question' },
@@ -157,25 +158,54 @@ function extractEntities(query: string): string[] {
 }
 
 /**
+ * Intent-specific boost terms for improved recall
+ * Each intent has primary (high weight) and secondary (lower weight) terms
+ */
+const INTENT_BOOST_TERMS: Record<QueryIntent, { primary: string[]; secondary: string[] }> = {
+  decision: {
+    primary: ['decided', 'chose', 'chosen', 'selected', 'decision', 'picked', 'went'],
+    secondary: ['because', 'reason', 'why', 'rationale', 'conclusion', 'option', 'alternative'],
+  },
+  action_item: {
+    primary: ['todo', 'task', 'action', 'item', 'pending', 'follow', 'followup'],
+    secondary: ['need', 'must', 'should', 'complete', 'finish', 'do', 'next', 'step', 'due', 'assigned', 'owner', 'deadline', 'priority', 'urgent'],
+  },
+  summarize: {
+    primary: ['summary', 'key', 'main', 'overview', 'highlight'],
+    secondary: ['important', 'point', 'conclusion', 'takeaway', 'finding', 'result', 'outcome'],
+  },
+  list: {
+    primary: ['list', 'items', 'all', 'every', 'each'],
+    secondary: ['mentioned', 'include', 'contain', 'enumerate', 'names', 'people', 'things'],
+  },
+  question: {
+    primary: [],
+    secondary: [],
+  },
+  search: {
+    primary: [],
+    secondary: [],
+  },
+};
+
+/**
  * Generate boost terms based on intent and keywords
+ * Now includes more comprehensive intent-specific terms for better recall
  */
 function generateBoostTerms(keywords: string[], intent: QueryIntent): string[] {
   const boostTerms = [...keywords];
-  
-  // Add intent-specific boost terms
-  switch (intent) {
-    case 'decision':
-      boostTerms.push('decided', 'chose', 'selected', 'because', 'reason');
-      break;
-    case 'action_item':
-      boostTerms.push('todo', 'need', 'must', 'should', 'action', 'next');
-      break;
-    case 'summarize':
-      boostTerms.push('key', 'main', 'important', 'summary');
-      break;
+
+  // Add intent-specific boost terms (primary first, then secondary)
+  const intentTerms = INTENT_BOOST_TERMS[intent];
+  if (intentTerms) {
+    // Add primary terms (high value)
+    boostTerms.push(...intentTerms.primary);
+    // Add secondary terms (lower value but helpful for recall)
+    boostTerms.push(...intentTerms.secondary);
   }
-  
-  return [...new Set(boostTerms)].slice(0, 15);
+
+  // Deduplicate and limit to avoid overly broad searches
+  return [...new Set(boostTerms)].slice(0, 20);
 }
 
 /**
