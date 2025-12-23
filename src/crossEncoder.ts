@@ -1,139 +1,136 @@
 /**
  * AuroraNotes API - Cross-Encoder Reranker
  *
- * Provides high-precision reranking using cross-encoder models.
- * Cross-encoders score query-passage pairs directly, providing
- * much better relevance signals than bi-encoder similarity.
- *
- * Supports multiple backends:
- * - Gemini-based (default, uses existing GenAI client)
- * - Cohere Rerank API (optional, requires COHERE_API_KEY)
- * - Vertex AI Ranking API (optional, for enterprise)
- *
- * Optimizations:
- * - Result caching to avoid redundant API calls
- * - Optimized prompt construction with pre-built templates
- * - Batch processing for multiple chunks
- * - Early exit for high-confidence results
- *
+ * High-precision reranking using cross-encoder models.
+ * Supports Gemini (default) and Cohere backends.
  * Typical improvement: +15-20% precision over bi-encoder only.
  */
 
 import { ScoredChunk } from "./types";
 import { logInfo, logError, logWarn, fastHashWithLength } from "./utils";
 import { getGenAIClient, isGenAIAvailable } from "./genaiClient";
+import {
+  CROSS_ENCODER_ENABLED,
+  CROSS_ENCODER_BACKEND,
+  CROSS_ENCODER_MAX_CHUNKS,
+  CROSS_ENCODER_TIMEOUT_MS,
+} from "./config";
 
-// Configuration
-const CROSS_ENCODER_ENABLED = process.env.CROSS_ENCODER_ENABLED !== 'false';
-const CROSS_ENCODER_BACKEND = process.env.CROSS_ENCODER_BACKEND || 'gemini'; // 'gemini' | 'cohere'
-const CROSS_ENCODER_MODEL = process.env.CROSS_ENCODER_MODEL || 'gemini-2.0-flash';
-const CROSS_ENCODER_MAX_CHUNKS = parseInt(process.env.CROSS_ENCODER_MAX_CHUNKS || '25');
-const CROSS_ENCODER_TIMEOUT_MS = parseInt(process.env.CROSS_ENCODER_TIMEOUT_MS || '5000');
+// =============================================================================
+// Constants
+// =============================================================================
+
+// Cohere configuration (not in main config since it's optional)
 const COHERE_API_KEY = process.env.COHERE_API_KEY || '';
 const COHERE_RERANK_MODEL = process.env.COHERE_RERANK_MODEL || 'rerank-v3.5';
+const CROSS_ENCODER_MODEL = process.env.CROSS_ENCODER_MODEL || 'gemini-2.0-flash';
 
-// Cache configuration for cross-encoder results
-const CROSS_ENCODER_CACHE_SIZE = 100;
-const CROSS_ENCODER_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+// Cache configuration
+const CACHE_SIZE = 100;
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const CACHE_EVICT_RATIO = 0.2;
 
-// Result cache to avoid redundant API calls
-interface CachedCrossEncoderResult {
-  scores: CrossEncoderScore[];
-  timestamp: number;
-}
-const crossEncoderCache = new Map<string, CachedCrossEncoderResult>();
+// Scoring weights
+const CROSS_ENCODER_WEIGHT = 0.7;
+const ORIGINAL_WEIGHT = 0.3;
 
-/**
- * Cross-encoder score result
- */
+// Text limits
+const MAX_PASSAGE_LENGTH = 300;
+const MAX_OUTPUT_TOKENS = 200;
+const TEMPERATURE = 0.1;
+
+// Pre-compiled regex
+const JSON_SCORES_REGEX = /\[[\d,\s.]+\]/;
+
+// =============================================================================
+// Types
+// =============================================================================
+
 interface CrossEncoderScore {
   chunkId: string;
   relevanceScore: number;
   originalRank: number;
 }
 
-/**
- * Generate cache key for cross-encoder results
- * Uses fast non-cryptographic hash for better performance
- */
-function makeCrossEncoderCacheKey(query: string, chunkIds: string[]): string {
-  // Use fast hash of query + sorted chunk IDs for consistent caching
+interface CacheEntry {
+  scores: CrossEncoderScore[];
+  timestamp: number;
+}
+
+type QueryType = 'factual' | 'procedural' | 'exploratory' | 'temporal';
+
+// =============================================================================
+// Cache
+// =============================================================================
+
+const cache = new Map<string, CacheEntry>();
+
+function makeCacheKey(query: string, chunkIds: string[]): string {
   const sortedIds = [...chunkIds].sort().join(',');
   return fastHashWithLength(`${query}:${sortedIds}`);
 }
 
-/**
- * Evict old cache entries
- */
-function evictCrossEncoderCache(): void {
-  if (crossEncoderCache.size < CROSS_ENCODER_CACHE_SIZE) return;
+function evictCache(): void {
+  if (cache.size < CACHE_SIZE) return;
 
   const now = Date.now();
-  const keysToDelete: string[] = [];
+  const expired: string[] = [];
 
-  for (const [key, entry] of crossEncoderCache) {
-    if (now - entry.timestamp > CROSS_ENCODER_CACHE_TTL_MS) {
-      keysToDelete.push(key);
+  for (const [key, entry] of cache) {
+    if (now - entry.timestamp > CACHE_TTL_MS) {
+      expired.push(key);
     }
   }
 
-  // If not enough expired, evict oldest
-  if (keysToDelete.length < CROSS_ENCODER_CACHE_SIZE * 0.2) {
-    const entries = Array.from(crossEncoderCache.entries());
-    entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
-    const toEvict = Math.ceil(CROSS_ENCODER_CACHE_SIZE * 0.2);
+  // Evict expired entries
+  for (const key of expired) {
+    cache.delete(key);
+  }
+
+  // If still over capacity, evict oldest
+  if (cache.size >= CACHE_SIZE) {
+    const entries = [...cache.entries()].sort((a, b) => a[1].timestamp - b[1].timestamp);
+    const toEvict = Math.ceil(CACHE_SIZE * CACHE_EVICT_RATIO);
     for (let i = 0; i < toEvict && i < entries.length; i++) {
-      keysToDelete.push(entries[i][0]);
+      cache.delete(entries[i][0]);
     }
-  }
-
-  for (const key of keysToDelete) {
-    crossEncoderCache.delete(key);
   }
 }
 
-// Query type detection for adaptive scoring criteria
-type QueryType = 'factual' | 'procedural' | 'exploratory' | 'temporal';
+// =============================================================================
+// Query Type Detection
+// =============================================================================
+
+const TEMPORAL_PATTERN = /\b(when|date|time|yesterday|today|last|recent|week|month)\b/;
+const PROCEDURAL_PATTERN = /\b(how|steps|process|procedure|guide|tutorial|instructions)\b/;
+const FACTUAL_PATTERN = /\b(what is|who is|define|explain|meaning)\b/;
 
 function detectQueryType(query: string): QueryType {
   const lower = query.toLowerCase();
-  if (/\b(when|date|time|yesterday|today|last|recent|week|month)\b/.test(lower)) return 'temporal';
-  if (/\b(how|steps|process|procedure|guide|tutorial|instructions)\b/.test(lower)) return 'procedural';
-  if (/\b(what is|who is|define|explain|meaning)\b/.test(lower)) return 'factual';
+  if (TEMPORAL_PATTERN.test(lower)) return 'temporal';
+  if (PROCEDURAL_PATTERN.test(lower)) return 'procedural';
+  if (FACTUAL_PATTERN.test(lower)) return 'factual';
   return 'exploratory';
 }
 
-// Query-type specific scoring guidance
 const SCORING_GUIDANCE: Record<QueryType, string> = {
-  factual: `- Direct answer with exact facts = 9-10
-- Contains the specific information = 7-8
-- Related but not definitive = 4-6
-- Only tangentially related = 1-3`,
-  procedural: `- Complete step-by-step instructions = 9-10
-- Partial steps or process = 7-8
-- Related procedures = 4-6
-- Only mentions the topic = 1-3`,
-  temporal: `- Contains exact dates/times asked about = 9-10
-- Has relevant temporal info = 7-8
-- General timeline context = 4-6
-- No temporal relevance = 1-3`,
-  exploratory: `- Comprehensive coverage of topic = 9-10
-- Significant relevant details = 7-8
-- Some useful context = 4-6
-- Peripheral information = 1-3`,
+  factual: '- Direct answer=9-10, Contains info=7-8, Related=4-6, Tangential=1-3',
+  procedural: '- Complete steps=9-10, Partial=7-8, Related=4-6, Mentions=1-3',
+  temporal: '- Exact dates=9-10, Temporal info=7-8, Timeline=4-6, None=1-3',
+  exploratory: '- Comprehensive=9-10, Significant=7-8, Some context=4-6, Peripheral=1-3',
 };
 
-// Pre-built prompt template (avoid string concatenation in hot path)
-const PROMPT_TEMPLATE_PREFIX = `You are a relevance scoring system. Score each passage's relevance to the query on a scale of 0-10.
+// =============================================================================
+// Prompt Building
+// =============================================================================
 
-Query: "`;
-const PROMPT_TEMPLATE_MIDDLE = `"
+function buildPrompt(query: string, passages: string, queryType: QueryType): string {
+  return `You are a relevance scoring system. Score each passage's relevance to the query on a scale of 0-10.
+
+Query: "${query}"
 
 Passages:
-`;
-// Dynamic suffix is built based on query type
-function buildPromptSuffix(queryType: QueryType): string {
-  return `
+${passages}
 
 For each passage, output ONLY a JSON array of scores in order, like: [8, 3, 9, 5, ...]
 Scoring criteria for this ${queryType} query:
@@ -143,53 +140,36 @@ ${SCORING_GUIDANCE[queryType]}
 Scores:`;
 }
 
-/**
- * Check if cross-encoder reranking is available
- */
+// =============================================================================
+// Public API
+// =============================================================================
+
 export function isCrossEncoderAvailable(): boolean {
   if (!CROSS_ENCODER_ENABLED) return false;
-
-  if (CROSS_ENCODER_BACKEND === 'cohere') {
-    return !!COHERE_API_KEY;
-  }
-
+  if (CROSS_ENCODER_BACKEND === 'cohere') return !!COHERE_API_KEY;
   return isGenAIAvailable();
 }
 
-// Pre-compiled regex for parsing JSON scores
-const JSON_SCORES_REGEX = /\[[\d,\s.]+\]/;
+// =============================================================================
+// Scoring Backends
+// =============================================================================
 
-/**
- * Gemini-based cross-encoder scoring
- * Uses a carefully crafted prompt for relevance assessment
- *
- * Optimizations:
- * - Pre-built prompt template to reduce string concatenation
- * - Pre-compiled regex for parsing
- * - Efficient passage list construction
- */
-async function scoreWithGemini(
-  query: string,
-  chunks: ScoredChunk[]
-): Promise<CrossEncoderScore[]> {
+function fallbackScores(chunks: ScoredChunk[]): CrossEncoderScore[] {
+  return chunks.map((c, i) => ({ chunkId: c.chunkId, relevanceScore: c.score, originalRank: i }));
+}
+
+async function scoreWithGemini(query: string, chunks: ScoredChunk[]): Promise<CrossEncoderScore[]> {
   const client = getGenAIClient();
   const chunksToScore = chunks.slice(0, CROSS_ENCODER_MAX_CHUNKS);
 
-  // Build passage list efficiently using array join
-  const passageParts: string[] = new Array(chunksToScore.length);
-  for (let i = 0; i < chunksToScore.length; i++) {
-    // Truncate text efficiently
-    const text = chunksToScore[i].text;
-    const truncated = text.length > 300 ? text.slice(0, 300) : text;
-    passageParts[i] = `[${i + 1}] ${truncated}`;
-  }
-  const passageList = passageParts.join('\n\n');
+  // Build passages
+  const passages = chunksToScore.map((c, i) => {
+    const text = c.text.length > MAX_PASSAGE_LENGTH ? c.text.slice(0, MAX_PASSAGE_LENGTH) : c.text;
+    return `[${i + 1}] ${text}`;
+  }).join('\n\n');
 
-  // Detect query type for adaptive scoring criteria
   const queryType = detectQueryType(query);
-
-  // Build prompt using pre-built template parts with adaptive suffix
-  const prompt = PROMPT_TEMPLATE_PREFIX + query + PROMPT_TEMPLATE_MIDDLE + passageList + buildPromptSuffix(queryType);
+  const prompt = buildPrompt(query, passages, queryType);
 
   try {
     const timeoutPromise = new Promise<never>((_, reject) => {
@@ -200,52 +180,32 @@ async function scoreWithGemini(
       client.models.generateContent({
         model: CROSS_ENCODER_MODEL,
         contents: prompt,
-        config: {
-          temperature: 0.1,
-          maxOutputTokens: 200,
-        },
+        config: { temperature: TEMPERATURE, maxOutputTokens: MAX_OUTPUT_TOKENS },
       }),
       timeoutPromise,
     ]);
 
     const response = result.text || '';
-
-    // Parse JSON array from response using pre-compiled regex
     const jsonMatch = response.match(JSON_SCORES_REGEX);
     if (!jsonMatch) {
       logWarn('Cross-encoder: failed to parse scores', { response: response.slice(0, 100) });
-      return chunksToScore.map((c, i) => ({ chunkId: c.chunkId, relevanceScore: c.score, originalRank: i }));
+      return fallbackScores(chunksToScore);
     }
 
     const scores: number[] = JSON.parse(jsonMatch[0]);
-
-    // Build results efficiently
-    const results: CrossEncoderScore[] = new Array(Math.min(chunksToScore.length, scores.length));
-    for (let i = 0; i < results.length; i++) {
-      results[i] = {
-        chunkId: chunksToScore[i].chunkId,
-        relevanceScore: (scores[i] || 0) / 10, // Normalize to 0-1
-        originalRank: i,
-      };
-    }
-    return results;
+    return chunksToScore.slice(0, scores.length).map((c, i) => ({
+      chunkId: c.chunkId,
+      relevanceScore: (scores[i] || 0) / 10,
+      originalRank: i,
+    }));
   } catch (err) {
     logError('Gemini cross-encoder failed', err);
-    return chunksToScore.map((c, i) => ({ chunkId: c.chunkId, relevanceScore: c.score, originalRank: i }));
+    return fallbackScores(chunksToScore);
   }
 }
 
-/**
- * Cohere Rerank API scoring
- * More accurate but requires separate API key
- */
-async function scoreWithCohere(
-  query: string,
-  chunks: ScoredChunk[]
-): Promise<CrossEncoderScore[]> {
-  if (!COHERE_API_KEY) {
-    return chunks.map((c, i) => ({ chunkId: c.chunkId, relevanceScore: c.score, originalRank: i }));
-  }
+async function scoreWithCohere(query: string, chunks: ScoredChunk[]): Promise<CrossEncoderScore[]> {
+  if (!COHERE_API_KEY) return fallbackScores(chunks);
 
   try {
     const documents = chunks.slice(0, CROSS_ENCODER_MAX_CHUNKS).map(c => c.text);
@@ -273,7 +233,6 @@ async function scoreWithCohere(
       results: Array<{ index: number; relevance_score: number }>;
     };
 
-    // Map back to chunk IDs
     const scoreMap = new Map<number, number>();
     for (const result of data.results) {
       scoreMap.set(result.index, result.relevance_score);
@@ -286,21 +245,14 @@ async function scoreWithCohere(
     }));
   } catch (err) {
     logError('Cohere rerank failed', err);
-    return chunks.map((c, i) => ({ chunkId: c.chunkId, relevanceScore: c.score, originalRank: i }));
+    return fallbackScores(chunks);
   }
 }
 
-/**
- * Rerank chunks using cross-encoder scoring
- *
- * This is the main entry point for cross-encoder reranking.
- * Falls back gracefully to original ranking if scoring fails.
- *
- * Optimizations:
- * - Result caching to avoid redundant API calls for same query/chunks
- * - Efficient chunk map construction
- * - Pre-allocated result array
- */
+// =============================================================================
+// Main Rerank Function
+// =============================================================================
+
 export async function crossEncoderRerank(
   query: string,
   chunks: ScoredChunk[],
@@ -313,41 +265,33 @@ export async function crossEncoderRerank(
   const startTime = Date.now();
   const chunksToScore = chunks.slice(0, CROSS_ENCODER_MAX_CHUNKS);
 
-  // Check cache first
+  // Check cache
   const chunkIds = chunksToScore.map(c => c.chunkId);
-  const cacheKey = makeCrossEncoderCacheKey(query, chunkIds);
-  const cached = crossEncoderCache.get(cacheKey);
+  const cacheKey = makeCacheKey(query, chunkIds);
+  const cached = cache.get(cacheKey);
 
   let scores: CrossEncoderScore[];
   let cacheHit = false;
 
-  if (cached && Date.now() - cached.timestamp < CROSS_ENCODER_CACHE_TTL_MS) {
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
     scores = cached.scores;
     cacheHit = true;
   } else {
-    // Score using configured backend
-    if (CROSS_ENCODER_BACKEND === 'cohere') {
-      scores = await scoreWithCohere(query, chunksToScore);
-    } else {
-      scores = await scoreWithGemini(query, chunksToScore);
-    }
+    scores = CROSS_ENCODER_BACKEND === 'cohere'
+      ? await scoreWithCohere(query, chunksToScore)
+      : await scoreWithGemini(query, chunksToScore);
 
-    // Cache the result
-    evictCrossEncoderCache();
-    crossEncoderCache.set(cacheKey, { scores, timestamp: Date.now() });
+    evictCache();
+    cache.set(cacheKey, { scores, timestamp: Date.now() });
   }
 
-  // Create lookup map for original chunks
+  // Build chunk lookup
   const chunkMap = new Map<string, ScoredChunk>();
   for (const chunk of chunks) {
     chunkMap.set(chunk.chunkId, chunk);
   }
 
-  // Combine cross-encoder score with original score (weighted blend)
-  const CROSS_ENCODER_WEIGHT = 0.7;
-  const ORIGINAL_WEIGHT = 0.3;
-
-  // Pre-allocate result array
+  // Combine scores and rerank
   const rerankedChunks: ScoredChunk[] = [];
   for (const score of scores) {
     const chunk = chunkMap.get(score.chunkId);
@@ -355,37 +299,20 @@ export async function crossEncoderRerank(
 
     rerankedChunks.push({
       ...chunk,
-      score: (score.relevanceScore * CROSS_ENCODER_WEIGHT) +
-             (chunk.score * ORIGINAL_WEIGHT),
+      score: score.relevanceScore * CROSS_ENCODER_WEIGHT + chunk.score * ORIGINAL_WEIGHT,
       crossEncoderScore: score.relevanceScore,
     });
   }
 
-  // Sort by new combined score
   rerankedChunks.sort((a, b) => b.score - a.score);
 
-  const elapsedMs = Date.now() - startTime;
   logInfo('Cross-encoder reranking complete', {
     inputChunks: chunks.length,
     scoredChunks: scores.length,
     backend: CROSS_ENCODER_BACKEND,
     cacheHit,
-    elapsedMs,
+    elapsedMs: Date.now() - startTime,
   });
 
   return topK ? rerankedChunks.slice(0, topK) : rerankedChunks;
 }
-
-/**
- * Get cross-encoder configuration for monitoring
- */
-export function getCrossEncoderConfig() {
-  return {
-    enabled: CROSS_ENCODER_ENABLED,
-    backend: CROSS_ENCODER_BACKEND,
-    model: CROSS_ENCODER_BACKEND === 'cohere' ? COHERE_RERANK_MODEL : CROSS_ENCODER_MODEL,
-    available: isCrossEncoderAvailable(),
-    maxChunks: CROSS_ENCODER_MAX_CHUNKS,
-  };
-}
-

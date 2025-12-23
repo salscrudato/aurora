@@ -1,17 +1,92 @@
-# This file specifies files that are *not* uploaded to Google Cloud
-# using gcloud. It follows the same syntax as .gitignore, with the addition of
-# "#!include" directives (which insert the entries of the given .gitignore-style
-# file at that point).
-#
-# For more information, run:
-#   $ gcloud topic gcloudignore
-#
-.gcloudignore
-# If you would like to upload your .git directory, .gitignore file or files
-# from your .gitignore file, remove the corresponding line
-# below:
-.git
-.gitignore
+# =============================================================================
+# AuroraNotes API - Google Cloud Ignore
+# Specifies files NOT uploaded to Cloud Run/Cloud Build
+# =============================================================================
 
-node_modules
+# Include everything from .gitignore
 #!include:.gitignore
+
+# -----------------------------------------------------------------------------
+# Git & Version Control
+# -----------------------------------------------------------------------------
+.git/
+.gitignore
+.gitattributes
+.github/
+
+# -----------------------------------------------------------------------------
+# Cloud Config (not needed in deployed image)
+# -----------------------------------------------------------------------------
+.gcloudignore
+.gcp/
+cloudbuild.yaml
+cloudbuild*.yaml
+
+# -----------------------------------------------------------------------------
+# Development Files
+# -----------------------------------------------------------------------------
+.vscode/
+.idea/
+*.md
+!README.md
+scripts/
+Makefile
+
+# -----------------------------------------------------------------------------
+# Test Files (not needed in production)
+# -----------------------------------------------------------------------------
+*.test.ts
+*.spec.ts
+__tests__/
+__mocks__/
+coverage/
+.nyc_output/
+jest.config.*
+vitest.config.*
+
+# -----------------------------------------------------------------------------
+# Documentation (not needed in deployed image)
+# -----------------------------------------------------------------------------
+docs/
+*.md
+LICENSE
+CHANGELOG*
+CONTRIBUTING*
+
+# -----------------------------------------------------------------------------
+# Local Development
+# -----------------------------------------------------------------------------
+.env.example
+docker-compose*.yml
+docker-compose*.yaml
+Dockerfile.dev
+Dockerfile.local
+
+# -----------------------------------------------------------------------------
+# Build Artifacts (built fresh in Cloud Build)
+# -----------------------------------------------------------------------------
+dist/
+build/
+node_modules/
+*.tsbuildinfo
+
+# -----------------------------------------------------------------------------
+# Secrets (should NEVER be deployed via source)
+# -----------------------------------------------------------------------------
+.env
+.env.*
+*.pem
+*.key
+*.p12
+service-account*.json
+firebase-adminsdk*.json
+*-credentials.json
+
+# -----------------------------------------------------------------------------
+# OS & Editor
+# -----------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

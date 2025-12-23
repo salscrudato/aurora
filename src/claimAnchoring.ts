@@ -10,57 +10,92 @@
  * This ensures each factual claim is properly grounded in source material.
  */
 
-import { ScoredChunk, Citation } from './types';
-import { logInfo, logWarn, logError } from './utils';
+import { ScoredChunk } from './types';
+import { logInfo, logWarn } from './utils';
+
+// =============================================================================
+// Constants
+// =============================================================================
 
 // Configuration
 const CLAIM_ANCHORING_CONFIG = {
   enabled: true,
-  minClaimLength: 10,               // Minimum characters for a valid claim
-  maxClaimLength: 500,              // Maximum characters for a claim
-  semanticMatchThreshold: 0.65,     // Min similarity for claim-source match
-  keywordOverlapWeight: 0.3,        // Weight for keyword overlap in matching
-  semanticWeight: 0.7,              // Weight for semantic similarity
-  requireExplicitSupport: true,     // Require explicit evidence for claims
+  minClaimLength: 10,
+  maxClaimLength: 500,
+  semanticMatchThreshold: 0.65,
+  keywordOverlapWeight: 0.3,
+  semanticWeight: 0.7,
+  requireExplicitSupport: true,
 };
 
-/**
- * Extracted claim from response
- */
+// Thresholds
+const SUPPORT_THRESHOLD_MULTIPLIER = 0.5;
+const PROCEDURAL_MATCH_THRESHOLD = 0.5;
+const CLAIM_TEXT_PREVIEW_LENGTH = 100;
+const MIN_KEYWORD_LENGTH = 2;
+
+// Pre-compiled regex patterns
+const SENTENCE_PATTERN = /[^.!?]+[.!?]+/g;
+const CITATION_PATTERN = /\[N(\d+)\]/g;
+const MISATTRIBUTION_PATTERN = /Citation (N\d+)/;
+const NON_WORD_CHARS = /[^\w\s]/g;
+
+// Claim classification patterns
+const DEFINITION_PATTERNS = [' is defined as ', ' refers to ', ' means '];
+const DEFINITION_REGEX = /^[a-z]+ is (a|an|the) /;
+const PROCEDURAL_PATTERNS = ['to do this', 'you can ', 'you should ', 'steps to '];
+const PROCEDURAL_REGEX = /^(first|then|next|finally),? /;
+const OPINION_PATTERNS = ['i think', 'in my opinion', 'it seems', 'arguably'];
+
+// Stopwords for keyword extraction
+const STOPWORDS = new Set([
+  'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+  'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should',
+  'may', 'might', 'must', 'shall', 'can', 'need', 'dare', 'ought', 'used', 'to', 'of',
+  'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as', 'into', 'through', 'during',
+  'before', 'after', 'above', 'below', 'between', 'under', 'again', 'further', 'then',
+  'once', 'here', 'there', 'when', 'where', 'why', 'how', 'all', 'each', 'few', 'more',
+  'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so',
+  'than', 'too', 'very', 'just', 'and', 'but', 'if', 'or', 'because', 'until', 'while',
+  'this', 'that', 'these', 'those', 'it', 'its'
+]);
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/** Claim type classification */
+export type ClaimType = 'factual' | 'opinion' | 'procedural' | 'definition';
+
+/** Extracted claim from response */
 export interface ExtractedClaim {
-  text: string;                     // The claim text
-  startIndex: number;               // Position in original response
+  text: string;
+  startIndex: number;
   endIndex: number;
-  citationIds: string[];            // Citations attached to this claim
-  claimType: 'factual' | 'opinion' | 'procedural' | 'definition';
+  citationIds: string[];
+  claimType: ClaimType;
 }
 
-/**
- * Claim verification result
- */
+/** Claim verification result */
 export interface ClaimVerification {
   claim: ExtractedClaim;
   isSupported: boolean;
-  supportingChunks: ScoredChunk[];  // Chunks that support this claim
-  matchScore: number;               // How well the claim matches sources
-  suggestedCitations: string[];     // Recommended citation IDs
-  issues: string[];                 // Any problems found
+  supportingChunks: ScoredChunk[];
+  matchScore: number;
+  suggestedCitations: string[];
+  issues: string[];
 }
 
-/**
- * Overall anchoring result
- */
+/** Overall anchoring result */
 export interface AnchoringResult {
   claims: ClaimVerification[];
-  overallScore: number;             // 0-1 how well grounded the response is
+  overallScore: number;
   unsupportedClaims: ExtractedClaim[];
   misattributedCitations: string[];
   repairSuggestions: RepairSuggestion[];
 }
 
-/**
- * Suggestion for repairing citation issues
- */
+/** Suggestion for repairing citation issues */
 export interface RepairSuggestion {
   claimText: string;
   issue: string;
@@ -68,109 +103,22 @@ export interface RepairSuggestion {
   confidence: number;
 }
 
-/**
- * Extract claims from response text
- * Uses sentence boundaries and citation markers to identify claims
- */
-export function extractClaims(responseText: string): ExtractedClaim[] {
-  const claims: ExtractedClaim[] = [];
+// =============================================================================
+// Keyword Extraction Helpers
+// =============================================================================
 
-  // Split by sentence boundaries while preserving positions
-  const sentencePattern = /[^.!?]+[.!?]+/g;
-  let match;
-
-  while ((match = sentencePattern.exec(responseText)) !== null) {
-    const sentence = match[0].trim();
-    const startIndex = match.index;
-    const endIndex = match.index + match[0].length;
-
-    // Skip if too short or too long
-    if (sentence.length < CLAIM_ANCHORING_CONFIG.minClaimLength ||
-        sentence.length > CLAIM_ANCHORING_CONFIG.maxClaimLength) {
-      continue;
-    }
-
-    // Extract citation IDs from this sentence
-    const citationPattern = /\[N(\d+)\]/g;
-    const citationIds: string[] = [];
-    let citMatch;
-    while ((citMatch = citationPattern.exec(sentence)) !== null) {
-      citationIds.push(`N${citMatch[1]}`);
-    }
-
-    // Classify claim type
-    const claimType = classifyClaimType(sentence);
-
-    claims.push({
-      text: sentence,
-      startIndex,
-      endIndex,
-      citationIds,
-      claimType,
-    });
-  }
-
-  return claims;
+/** Extract keywords from text for matching */
+function extractKeywords(text: string): Set<string> {
+  return new Set(
+    text.toLowerCase()
+      .replace(NON_WORD_CHARS, '')
+      .split(/\s+/)
+      .filter(w => w.length > MIN_KEYWORD_LENGTH && !STOPWORDS.has(w))
+  );
 }
 
-/**
- * Classify the type of claim
- */
-function classifyClaimType(sentence: string): ExtractedClaim['claimType'] {
-  const lower = sentence.toLowerCase();
-
-  // Definition patterns
-  if (lower.includes(' is defined as ') ||
-      lower.includes(' refers to ') ||
-      lower.includes(' means ') ||
-      /^[a-z]+ is (a|an|the) /.test(lower)) {
-    return 'definition';
-  }
-
-  // Procedural patterns
-  if (lower.includes('to do this') ||
-      lower.includes('you can ') ||
-      lower.includes('you should ') ||
-      lower.includes('steps to ') ||
-      /^(first|then|next|finally),? /.test(lower)) {
-    return 'procedural';
-  }
-
-  // Opinion patterns
-  if (lower.includes('i think') ||
-      lower.includes('in my opinion') ||
-      lower.includes('it seems') ||
-      lower.includes('arguably')) {
-    return 'opinion';
-  }
-
-  // Default to factual
-  return 'factual';
-}
-
-/**
- * Calculate keyword overlap between claim and chunk
- */
+/** Calculate keyword overlap between claim and chunk (0-1) */
 function calculateKeywordOverlap(claim: string, chunkText: string): number {
-  const extractKeywords = (text: string): Set<string> => {
-    const stopwords = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
-      'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should',
-      'may', 'might', 'must', 'shall', 'can', 'need', 'dare', 'ought', 'used', 'to', 'of',
-      'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as', 'into', 'through', 'during',
-      'before', 'after', 'above', 'below', 'between', 'under', 'again', 'further', 'then',
-      'once', 'here', 'there', 'when', 'where', 'why', 'how', 'all', 'each', 'few', 'more',
-      'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so',
-      'than', 'too', 'very', 'just', 'and', 'but', 'if', 'or', 'because', 'until', 'while',
-      'this', 'that', 'these', 'those', 'it', 'its']);
-
-    return new Set(
-      text.toLowerCase()
-        .replace(/[^\w\s]/g, '')
-        .split(/\s+/)
-        .filter(w => w.length > 2 && !stopwords.has(w))
-    );
-  };
-
   const claimKeywords = extractKeywords(claim);
   const chunkKeywords = extractKeywords(chunkText);
 
@@ -184,9 +132,89 @@ function calculateKeywordOverlap(claim: string, chunkText: string): number {
   return overlap / claimKeywords.size;
 }
 
-/**
- * Find the best matching chunk for a claim
- */
+// =============================================================================
+// Claim Classification
+// =============================================================================
+
+/** Check if text matches any pattern in list */
+function matchesAnyPattern(text: string, patterns: string[]): boolean {
+  return patterns.some(p => text.includes(p));
+}
+
+/** Classify the type of claim */
+function classifyClaimType(sentence: string): ClaimType {
+  const lower = sentence.toLowerCase();
+
+  if (matchesAnyPattern(lower, DEFINITION_PATTERNS) || DEFINITION_REGEX.test(lower)) {
+    return 'definition';
+  }
+  if (matchesAnyPattern(lower, PROCEDURAL_PATTERNS) || PROCEDURAL_REGEX.test(lower)) {
+    return 'procedural';
+  }
+  if (matchesAnyPattern(lower, OPINION_PATTERNS)) {
+    return 'opinion';
+  }
+  return 'factual';
+}
+
+/** Extract citation IDs from a sentence */
+function extractCitationIds(sentence: string): string[] {
+  // Reset lastIndex for global regex
+  CITATION_PATTERN.lastIndex = 0;
+  const ids: string[] = [];
+  let match;
+  while ((match = CITATION_PATTERN.exec(sentence)) !== null) {
+    ids.push(`N${match[1]}`);
+  }
+  return ids;
+}
+
+// =============================================================================
+// Claim Extraction
+// =============================================================================
+
+/** Extract claims from response text using sentence boundaries */
+export function extractClaims(responseText: string): ExtractedClaim[] {
+  const claims: ExtractedClaim[] = [];
+
+  // Reset lastIndex for global regex
+  SENTENCE_PATTERN.lastIndex = 0;
+  let match;
+
+  while ((match = SENTENCE_PATTERN.exec(responseText)) !== null) {
+    const sentence = match[0].trim();
+    const { minClaimLength, maxClaimLength } = CLAIM_ANCHORING_CONFIG;
+
+    // Skip if outside valid length range
+    if (sentence.length < minClaimLength || sentence.length > maxClaimLength) {
+      continue;
+    }
+
+    claims.push({
+      text: sentence,
+      startIndex: match.index,
+      endIndex: match.index + match[0].length,
+      citationIds: extractCitationIds(sentence),
+      claimType: classifyClaimType(sentence),
+    });
+  }
+
+  return claims;
+}
+
+// =============================================================================
+// Chunk Matching
+// =============================================================================
+
+/** Calculate combined score for a chunk matching a claim */
+function calculateCombinedScore(claimText: string, chunk: ScoredChunk): number {
+  const { keywordOverlapWeight, semanticWeight } = CLAIM_ANCHORING_CONFIG;
+  const keywordScore = calculateKeywordOverlap(claimText, chunk.text);
+  const semanticScore = chunk.score;
+  return keywordOverlapWeight * keywordScore + semanticWeight * semanticScore;
+}
+
+/** Find the best matching chunk for a claim */
 export function findBestMatchingChunk(
   claim: ExtractedClaim,
   chunks: ScoredChunk[]
@@ -195,20 +223,9 @@ export function findBestMatchingChunk(
   let bestScore = 0;
 
   for (const chunk of chunks) {
-    // Calculate keyword overlap
-    const keywordScore = calculateKeywordOverlap(claim.text, chunk.text);
-
-    // Use chunk's existing score as a proxy for semantic relevance
-    // In production, you'd compute actual semantic similarity here
-    const semanticScore = chunk.score;
-
-    // Combined score
-    const combinedScore =
-      CLAIM_ANCHORING_CONFIG.keywordOverlapWeight * keywordScore +
-      CLAIM_ANCHORING_CONFIG.semanticWeight * semanticScore;
-
-    if (combinedScore > bestScore) {
-      bestScore = combinedScore;
+    const score = calculateCombinedScore(claim.text, chunk);
+    if (score > bestScore) {
+      bestScore = score;
       bestChunk = chunk;
     }
   }
@@ -216,9 +233,16 @@ export function findBestMatchingChunk(
   return { chunk: bestChunk, score: bestScore };
 }
 
-/**
- * Verify a single claim against source chunks
- */
+// =============================================================================
+// Claim Verification
+// =============================================================================
+
+/** Check if a claim type is inherently supported without source citation */
+function isInherentlySupported(claimType: ClaimType, matchScore: number): boolean {
+  return claimType === 'opinion' || (claimType === 'procedural' && matchScore > PROCEDURAL_MATCH_THRESHOLD);
+}
+
+/** Verify a single claim against source chunks */
 export function verifyClaim(
   claim: ExtractedClaim,
   chunks: ScoredChunk[],
@@ -227,6 +251,7 @@ export function verifyClaim(
   const issues: string[] = [];
   const supportingChunks: ScoredChunk[] = [];
   const suggestedCitations: string[] = [];
+  const supportThreshold = CLAIM_ANCHORING_CONFIG.semanticMatchThreshold * SUPPORT_THRESHOLD_MULTIPLIER;
 
   // Check if cited chunks actually support this claim
   for (const citId of claim.citationIds) {
@@ -237,18 +262,18 @@ export function verifyClaim(
     }
 
     const keywordScore = calculateKeywordOverlap(claim.text, chunk.text);
-    if (keywordScore >= CLAIM_ANCHORING_CONFIG.semanticMatchThreshold * 0.5) {
+    if (keywordScore >= supportThreshold) {
       supportingChunks.push(chunk);
     } else {
       issues.push(`Citation ${citId} may not directly support this claim (overlap: ${(keywordScore * 100).toFixed(0)}%)`);
     }
   }
 
-  // Find best matching chunk if no citations or citations don't match
+  // Find best matching chunk
   const { chunk: bestMatch, score: matchScore } = findBestMatchingChunk(claim, chunks);
 
+  // Suggest citation if match is good enough
   if (bestMatch && matchScore >= CLAIM_ANCHORING_CONFIG.semanticMatchThreshold) {
-    // Find the citation ID for this chunk
     for (const [id, c] of chunkIdMap.entries()) {
       if (c === bestMatch && !suggestedCitations.includes(id)) {
         suggestedCitations.push(id);
@@ -257,41 +282,73 @@ export function verifyClaim(
   }
 
   // Determine if claim is supported
-  const isSupported = supportingChunks.length > 0 ||
-    (claim.claimType === 'opinion') ||
-    (claim.claimType === 'procedural' && matchScore > 0.5);
+  const isSupported = supportingChunks.length > 0 || isInherentlySupported(claim.claimType, matchScore);
 
   if (!isSupported && claim.claimType === 'factual') {
     issues.push('Factual claim lacks sufficient source support');
   }
 
-  return {
-    claim,
-    isSupported,
-    supportingChunks,
-    matchScore,
-    suggestedCitations,
-    issues,
-  };
+  return { claim, isSupported, supportingChunks, matchScore, suggestedCitations, issues };
 }
 
-/**
- * Anchor all claims in a response to source chunks
- */
-export function anchorClaims(
-  responseText: string,
-  chunks: ScoredChunk[]
-): AnchoringResult {
-  // Extract claims
+// =============================================================================
+// Anchoring Pipeline
+// =============================================================================
+
+/** Build chunk ID map from chunks array */
+function buildChunkIdMap(chunks: ScoredChunk[]): Map<string, ScoredChunk> {
+  return new Map(chunks.map((chunk, idx) => [`N${idx + 1}`, chunk]));
+}
+
+/** Extract misattributed citation from issue text */
+function extractMisattributedCitation(issue: string): string | null {
+  if (!issue.includes('may not directly support')) return null;
+  const match = issue.match(MISATTRIBUTION_PATTERN);
+  return match ? match[1] : null;
+}
+
+/** Truncate claim text for repair suggestion */
+function truncateClaimText(text: string): string {
+  return text.length > CLAIM_TEXT_PREVIEW_LENGTH
+    ? text.substring(0, CLAIM_TEXT_PREVIEW_LENGTH) + '...'
+    : text;
+}
+
+/** Process a single claim verification and collect results */
+function processVerification(
+  verification: ClaimVerification,
+  unsupportedClaims: ExtractedClaim[],
+  misattributedCitations: string[],
+  repairSuggestions: RepairSuggestion[]
+): void {
+  if (!verification.isSupported) {
+    unsupportedClaims.push(verification.claim);
+  }
+
+  // Check for misattributed citations
+  for (const issue of verification.issues) {
+    const citId = extractMisattributedCitation(issue);
+    if (citId && !misattributedCitations.includes(citId)) {
+      misattributedCitations.push(citId);
+    }
+  }
+
+  // Generate repair suggestions
+  if (verification.issues.length > 0 && verification.suggestedCitations.length > 0) {
+    repairSuggestions.push({
+      claimText: truncateClaimText(verification.claim.text),
+      issue: verification.issues[0],
+      suggestedFix: `Consider using citation ${verification.suggestedCitations[0]} instead`,
+      confidence: verification.matchScore,
+    });
+  }
+}
+
+/** Anchor all claims in a response to source chunks */
+export function anchorClaims(responseText: string, chunks: ScoredChunk[]): AnchoringResult {
   const claims = extractClaims(responseText);
+  const chunkIdMap = buildChunkIdMap(chunks);
 
-  // Build chunk ID map
-  const chunkIdMap = new Map<string, ScoredChunk>();
-  chunks.forEach((chunk, idx) => {
-    chunkIdMap.set(`N${idx + 1}`, chunk);
-  });
-
-  // Verify each claim
   const verifications: ClaimVerification[] = [];
   const unsupportedClaims: ExtractedClaim[] = [];
   const misattributedCitations: string[] = [];
@@ -300,33 +357,9 @@ export function anchorClaims(
   for (const claim of claims) {
     const verification = verifyClaim(claim, chunks, chunkIdMap);
     verifications.push(verification);
-
-    if (!verification.isSupported) {
-      unsupportedClaims.push(claim);
-    }
-
-    // Check for misattributed citations
-    for (const issue of verification.issues) {
-      if (issue.includes('may not directly support')) {
-        const citMatch = issue.match(/Citation (N\d+)/);
-        if (citMatch && !misattributedCitations.includes(citMatch[1])) {
-          misattributedCitations.push(citMatch[1]);
-        }
-      }
-    }
-
-    // Generate repair suggestions
-    if (verification.issues.length > 0 && verification.suggestedCitations.length > 0) {
-      repairSuggestions.push({
-        claimText: claim.text.substring(0, 100) + (claim.text.length > 100 ? '...' : ''),
-        issue: verification.issues[0],
-        suggestedFix: `Consider using citation ${verification.suggestedCitations[0]} instead`,
-        confidence: verification.matchScore,
-      });
-    }
+    processVerification(verification, unsupportedClaims, misattributedCitations, repairSuggestions);
   }
 
-  // Calculate overall score
   const supportedCount = verifications.filter(v => v.isSupported).length;
   const overallScore = verifications.length > 0 ? supportedCount / verifications.length : 1;
 
@@ -336,26 +369,19 @@ export function anchorClaims(
     logWarn(`Claim anchoring: ${misattributedCitations.length} potentially misattributed citations`);
   }
 
-  return {
-    claims: verifications,
-    overallScore,
-    unsupportedClaims,
-    misattributedCitations,
-    repairSuggestions,
-  };
+  return { claims: verifications, overallScore, unsupportedClaims, misattributedCitations, repairSuggestions };
 }
 
-/**
- * Configuration getter
- */
+// =============================================================================
+// Configuration API
+// =============================================================================
+
+/** Get claim anchoring configuration (returns a copy) */
 export function getClaimAnchoringConfig() {
   return { ...CLAIM_ANCHORING_CONFIG };
 }
 
-/**
- * Check if claim anchoring is enabled
- */
+/** Check if claim anchoring is enabled */
 export function isClaimAnchoringEnabled(): boolean {
   return CLAIM_ANCHORING_CONFIG.enabled;
 }
-

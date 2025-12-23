@@ -1,10 +1,14 @@
 /**
- * AuroraNotes API - Chat Service
+ * Chat Service
  *
- * RAG-powered chat with inline citations, retry logic, and enhanced error handling.
- * Includes structured retrieval logging for observability.
+ * RAG-powered chat with inline citations, retry logic, and structured retrieval logging.
  */
 
+// =============================================================================
+// Imports
+// =============================================================================
+
+// Configuration
 import {
   CHAT_MODEL,
   CHAT_TIMEOUT_MS,
@@ -14,18 +18,33 @@ import {
   CHAT_TOP_K,
   LLM_MAX_OUTPUT_TOKENS,
   RETRIEVAL_TOP_K,
-  RETRIEVAL_RERANK_TO,
   DEFAULT_TENANT_ID,
   LLM_CONTEXT_BUDGET_CHARS,
   LLM_CONTEXT_RESERVE_CHARS,
   CITATION_RETRY_ENABLED,
   CITATION_VERIFICATION_ENABLED,
   CITATION_MIN_OVERLAP_SCORE,
-} from "./config";
-import { ChatRequest, ChatResponse, Citation, ScoredChunk, QueryIntent, SourcesPack, Source, ConfidenceLevel, ResponseMeta } from "./types";
-import { retrieveRelevantChunks, analyzeQuery, calculateAdaptiveK } from "./retrieval";
-import { logInfo, logError, logWarn, sanitizeText, isValidTenantId } from "./utils";
-import { validateCitationsWithChunks } from "./citationValidator";
+} from './config';
+
+// Types
+import {
+  ChatRequest,
+  ChatResponse,
+  Citation,
+  ScoredChunk,
+  QueryIntent,
+  SourcesPack,
+  Source,
+  ConfidenceLevel,
+} from './types';
+
+// Core modules
+import { retrieveRelevantChunks, analyzeQuery, calculateAdaptiveK } from './retrieval';
+import { logInfo, logError, logWarn, sanitizeText, isValidTenantId } from './utils';
+import { validateCitationsWithChunks } from './citationValidator';
+import { getGenAIClient, isGenAIAvailable } from './genaiClient';
+
+// Retrieval logging
 import {
   createRetrievalLog,
   logRetrieval,
@@ -36,57 +55,66 @@ import {
   CitationValidationStats,
   computeScoreDistribution,
   candidateCountsToStageDetails,
-} from "./retrievalLogger";
-import { getGenAIClient, isGenAIAvailable } from "./genaiClient";
+} from './retrievalLogger';
 
-// Enhanced response quality modules
-import { postProcessResponse, validateResponseQuality, validateAndFixResponse, enforceResponseConsistency } from "./responsePostProcessor";
-import { calculateResponseConfidence, getConfidenceSummary } from "./responseConfidence";
-import { extractClaimCitationPairs, batchScoreCitations, filterByConfidence, aggregateConfidenceScores } from "./citationConfidence";
+// Response processing
+import {
+  postProcessResponse,
+  validateResponseQuality,
+  enforceResponseConsistency,
+} from './responsePostProcessor';
+import { calculateResponseConfidence, getConfidenceSummary } from './responseConfidence';
+import {
+  extractClaimCitationPairs,
+  batchScoreCitations,
+  filterByConfidence,
+  aggregateConfidenceScores,
+} from './citationConfidence';
 
-// New enhanced modules for improved citation accuracy
-import { runUnifiedCitationPipeline, quickVerifyCitation, analyzeContradiction } from "./unifiedCitationPipeline";
-import { buildEnhancedSystemPrompt, buildCompleteEnhancedPrompt } from "./enhancedPrompts";
-import { buildCompleteAgenticPrompt, ResponseFormat } from "./agenticPrompts";
-import { computeSemanticAnchors, buildSourceAnchorHints } from "./claimExtraction";
+// Citation verification pipeline
+import { runUnifiedCitationPipeline } from './unifiedCitationPipeline';
+import { buildCompleteEnhancedPrompt } from './enhancedPrompts';
+import { buildCompleteAgenticPrompt, ResponseFormat } from './agenticPrompts';
 
-// Additional enhancement modules for response consistency and citation accuracy
-import { selectBestResponse, extractCitationIds, filterInconsistentCitations, isSelfConsistencyEnabled, ResponseCandidate } from "./selfConsistency";
-import { anchorClaims, isClaimAnchoringEnabled, AnchoringResult } from "./claimAnchoring";
-import { validateAndRepair, validateResponse, getValidationConfig } from "./responseValidation";
+// Response validation
+import { anchorClaims, isClaimAnchoringEnabled, AnchoringResult } from './claimAnchoring';
+import { validateAndRepair } from './responseValidation';
 
-// Retry configuration
-const MAX_LLM_RETRIES = 2;
-const LLM_RETRY_DELAY_MS = 1000;
+// =============================================================================
+// Configuration
+// =============================================================================
 
-/**
- * Create a timeout promise that rejects after specified milliseconds
- */
-function createTimeout<T>(ms: number, context: string): Promise<T> {
-  return new Promise((_, reject) => {
-    setTimeout(() => {
-      reject(new Error(`Timeout after ${ms}ms: ${context}`));
-    }, ms);
-  });
-}
+/** LLM retry configuration */
+const LLM_CONFIG = {
+  MAX_RETRIES: 2,
+  RETRY_DELAY_MS: 1000,
+} as const;
 
-// Citation accuracy thresholds (tuned for better recall while maintaining precision)
-const MIN_CITATION_COVERAGE = 0.5;        // Trigger repair if < 50% of sources cited
-const MIN_CITATION_COVERAGE_STRICT = 0.6; // Warn if < 60% coverage after repair
+/** Citation coverage thresholds */
+const CITATION_THRESHOLDS = {
+  MIN_COVERAGE: 0.5,        // Trigger repair if < 50% of sources cited
+  MIN_COVERAGE_STRICT: 0.6, // Warn if < 60% coverage after repair
+} as const;
 
-// Feature flags for enhanced verification
-const UNIFIED_PIPELINE_ENABLED = true;    // Use new unified citation verification pipeline
-const CONSISTENCY_ENFORCEMENT_ENABLED = true;  // Enforce response consistency
-const ENHANCED_PROMPTS_ENABLED = true;     // Use optimized v2 prompts (conversational, concise)
-const AGENTIC_PROMPTS_ENABLED = true;      // Use new agentic prompt framework (overrides ENHANCED_PROMPTS)
+/** Feature flags */
+const FEATURES = {
+  UNIFIED_PIPELINE: true,        // Use unified citation verification pipeline
+  CONSISTENCY_ENFORCEMENT: true, // Enforce response consistency
+  ENHANCED_PROMPTS: true,        // Use optimized v2 prompts
+  AGENTIC_PROMPTS: true,         // Use agentic prompt framework (overrides ENHANCED_PROMPTS)
+} as const;
 
-// NOTE: MIN_CITATION_SCORE filtering is now done in retrieval (MIN_COMBINED_SCORE)
-// to ensure prompt source count == citationsMap.size EXACTLY.
-// All chunks returned from retrieval are "source-worthy" and included in citations.
+/** Context source filtering */
+const CONTEXT_SOURCE_CONFIG = {
+  MIN_RELEVANCE: 0.40,  // Minimum relevance for context sources
+  MAX_COUNT: 4,         // Maximum context sources to include
+} as const;
 
-/**
- * Custom error for server configuration issues (not client errors)
- */
+// =============================================================================
+// Custom Error Classes
+// =============================================================================
+
+/** Error for server configuration issues (not client errors) */
 export class ConfigurationError extends Error {
   constructor(message: string) {
     super(message);
@@ -94,9 +122,7 @@ export class ConfigurationError extends Error {
   }
 }
 
-/**
- * Custom error for rate limiting
- */
+/** Error for rate limiting */
 export class RateLimitError extends Error {
   constructor(message: string) {
     super(message);
@@ -104,9 +130,33 @@ export class RateLimitError extends Error {
   }
 }
 
-/**
- * Retry LLM call with exponential backoff and hard timeout
- */
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+/** Create a timeout promise that rejects after specified milliseconds */
+function createTimeout<T>(ms: number, context: string): Promise<T> {
+  return new Promise((_, reject) => {
+    setTimeout(() => reject(new Error(`Timeout after ${ms}ms: ${context}`)), ms);
+  });
+}
+
+/** Sleep for specified milliseconds */
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+/** Check if error message indicates non-retryable error */
+function isNonRetryableError(message: string): boolean {
+  return message.includes('INVALID_ARGUMENT') ||
+         message.includes('PERMISSION_DENIED') ||
+         message.includes('API key');
+}
+
+/** Check if error message indicates rate limiting */
+function isRateLimitError(message: string): boolean {
+  return message.includes('429') || message.includes('RESOURCE_EXHAUSTED');
+}
+
+/** Retry LLM call with exponential backoff and hard timeout */
 async function withLLMRetry<T>(
   fn: () => Promise<T>,
   context: string,
@@ -114,39 +164,24 @@ async function withLLMRetry<T>(
 ): Promise<T> {
   let lastError: Error | unknown;
 
-  for (let attempt = 0; attempt <= MAX_LLM_RETRIES; attempt++) {
+  for (let attempt = 0; attempt <= LLM_CONFIG.MAX_RETRIES; attempt++) {
     try {
-      // Race between LLM call and timeout
-      const result = await Promise.race([
-        fn(),
-        createTimeout<T>(timeoutMs, context),
-      ]);
-      return result;
+      return await Promise.race([fn(), createTimeout<T>(timeoutMs, context)]);
     } catch (err) {
       lastError = err;
       const errMessage = err instanceof Error ? err.message : String(err);
 
-      // Don't retry on certain errors
-      if (errMessage.includes('INVALID_ARGUMENT') ||
-          errMessage.includes('PERMISSION_DENIED') ||
-          errMessage.includes('API key')) {
-        throw err;
-      }
+      if (isNonRetryableError(errMessage)) throw err;
+      if (isRateLimitError(errMessage)) throw new RateLimitError('API rate limit exceeded');
 
-      // Check for rate limiting
-      if (errMessage.includes('429') || errMessage.includes('RESOURCE_EXHAUSTED')) {
-        throw new RateLimitError('API rate limit exceeded');
-      }
-
-      // Log timeout errors with context for debugging
       if (errMessage.includes('Timeout')) {
         logWarn(`${context} timeout`, { attempt: attempt + 1, timeoutMs });
       }
 
-      if (attempt < MAX_LLM_RETRIES) {
-        const delay = LLM_RETRY_DELAY_MS * Math.pow(2, attempt);
+      if (attempt < LLM_CONFIG.MAX_RETRIES) {
+        const delay = LLM_CONFIG.RETRY_DELAY_MS * Math.pow(2, attempt);
         logWarn(`${context} retry`, { attempt: attempt + 1, delayMs: delay });
-        await new Promise(resolve => setTimeout(resolve, delay));
+        await sleep(delay);
       }
     }
   }
@@ -154,19 +189,18 @@ async function withLLMRetry<T>(
   throw lastError;
 }
 
-// Pre-compiled regex for sentence splitting
+// =============================================================================
+// Snippet Extraction
+// =============================================================================
+
+/** Pre-compiled regex for sentence splitting */
 const SENTENCE_SPLIT_REGEX = /(?<=[.!?])\s+/;
 
-/**
- * Count how many query terms appear in a text (case-insensitive)
- * Optimized: pre-lowercase text once, use indexOf for speed
- */
+/** Count query terms appearing in text (case-insensitive) */
 function countQueryTermMatches(lowerText: string, queryTermsLower: string[]): number {
   let count = 0;
   for (const term of queryTermsLower) {
-    if (lowerText.includes(term)) {
-      count++;
-    }
+    if (lowerText.includes(term)) count++;
   }
   return count;
 }
@@ -261,28 +295,18 @@ function extractBestSnippet(
   return truncated + '…';
 }
 
+// =============================================================================
+// Source Building
+// =============================================================================
+
 /**
- * Build a SourcesPack from scored chunks - the single source of truth for sources/citations.
- *
- * IMPORTANT: No filtering here! All chunks passed in are "source-worthy"
- * (already filtered by MIN_COMBINED_SCORE in retrieval).
- * This ensures prompt source count == citationsMap.size EXACTLY.
- *
- * Optimizations:
- * - Pre-allocate Map with expected size
- * - Use for loop instead of forEach for better performance
- * - Cache date conversion
- *
- * @param chunks - The exact chunks to use as sources (already filtered/reranked)
- * @param queryTerms - Optional query terms for query-aware snippet extraction
- * @returns SourcesPack with 1:1 mapping between sources and citations
+ * Build a SourcesPack from scored chunks - single source of truth for sources/citations.
+ * All chunks passed in are "source-worthy" (already filtered in retrieval).
  */
 export function buildSourcesPack(chunks: ScoredChunk[], queryTerms: string[] = []): SourcesPack {
   const citationsMap = new Map<string, Citation>();
-  const chunkCount = chunks.length;
 
-  // Create 1:1 mapping - every chunk becomes a citation
-  for (let i = 0; i < chunkCount; i++) {
+  for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
     const cid = `N${i + 1}`;
     const citation: Citation = {
@@ -293,35 +317,32 @@ export function buildSourcesPack(chunks: ScoredChunk[], queryTerms: string[] = [
       snippet: extractBestSnippet(chunk.text, 250, queryTerms),
       score: Math.round(chunk.score * 100) / 100,
     };
-    // Include offset information for precise citation anchoring (if available)
+
+    // Include offset information for precise citation anchoring
     if (chunk.startOffset !== undefined) citation.startOffset = chunk.startOffset;
     if (chunk.endOffset !== undefined) citation.endOffset = chunk.endOffset;
     if (chunk.anchor) citation.anchor = chunk.anchor;
+
     citationsMap.set(cid, citation);
   }
 
-  return {
-    sources: chunks,
-    citationsMap,
-    sourceCount: chunkCount, // Equals citationsMap.size
-  };
+  return { sources: chunks, citationsMap, sourceCount: chunks.length };
 }
 
-/**
- * Extract key topics from chunks for context hints
- */
-function extractTopicsFromChunks(chunks: ScoredChunk[]): string[] {
-  const topicPatterns = [
-    /\b(meeting|sprint|planning|decision|architecture|design)\b/gi,
-    /\b(RAG|pipeline|chunking|embedding|retrieval|vector)\b/gi,
-    /\b(Cloud Run|Firestore|API|backend|frontend)\b/gi,
-    /\b(pagination|scaling|performance|optimization)\b/gi,
-  ];
+/** Topic patterns for context hints */
+const TOPIC_PATTERNS = [
+  /\b(meeting|sprint|planning|decision|architecture|design)\b/gi,
+  /\b(RAG|pipeline|chunking|embedding|retrieval|vector)\b/gi,
+  /\b(Cloud Run|Firestore|API|backend|frontend)\b/gi,
+  /\b(pagination|scaling|performance|optimization)\b/gi,
+];
 
+/** Extract key topics from chunks for context hints */
+function extractTopicsFromChunks(chunks: ScoredChunk[]): string[] {
   const topics = new Set<string>();
   const allText = chunks.map(c => c.text).join(' ').toLowerCase();
 
-  for (const pattern of topicPatterns) {
+  for (const pattern of TOPIC_PATTERNS) {
     const matches = allText.match(pattern);
     if (matches) {
       matches.slice(0, 3).forEach(m => topics.add(m.toLowerCase()));
@@ -331,23 +352,16 @@ function extractTopicsFromChunks(chunks: ScoredChunk[]): string[] {
   return Array.from(topics).slice(0, 5);
 }
 
-/**
- * Convert citations to human-readable Source objects for the new response format
- */
+/** Convert citations to human-readable Source objects */
 function citationsToSources(citations: Citation[]): Source[] {
   return citations.map(c => {
     const source: Source = {
       id: c.cid.replace('N', ''),
       noteId: c.noteId,
       preview: c.snippet.length > 120 ? c.snippet.slice(0, 117) + '...' : c.snippet,
-      date: new Date(c.createdAt).toLocaleDateString('en-US', {
-        month: 'short',
-        day: 'numeric',
-        year: 'numeric',
-      }),
+      date: new Date(c.createdAt).toLocaleDateString('en-US', DATE_FORMAT_OPTIONS),
       relevance: Math.round(c.score * 100) / 100,
     };
-    // Include offset information for precise citation anchoring (if available)
     if (c.startOffset !== undefined) source.startOffset = c.startOffset;
     if (c.endOffset !== undefined) source.endOffset = c.endOffset;
     if (c.anchor) source.anchor = c.anchor;
@@ -355,69 +369,31 @@ function citationsToSources(citations: Citation[]): Source[] {
   });
 }
 
-/**
- * Build contextSources from chunks that were used as context but not cited in the answer.
- * These are sources the LLM had access to but didn't directly quote.
- *
- * @param allChunks - All chunks used as context for the LLM (after reranking)
- * @param citedChunkIds - Set of chunkIds that were cited in the answer
- * @param startId - Starting ID number for context sources (should be lastCitedId + 1)
- * @param queryTerms - Query terms for snippet extraction
- * @returns Array of Source objects for uncited context sources
- */
-// Minimum relevance threshold for context sources (filter out noise)
-// Increased to 0.40 to avoid showing irrelevant context that dilutes precision
-const CONTEXT_SOURCE_MIN_RELEVANCE = 0.40;
-const CONTEXT_SOURCE_MAX_COUNT = 4;  // Reduced for cleaner, more focused responses
-
+/** Build contextSources from chunks used as context but not cited */
 function buildContextSources(
   allChunks: ScoredChunk[],
   citedChunkIds: Set<string>,
-  startId: number,
-  queryTerms: string[] = []
+  startId: number
 ): Source[] {
-  // Filter out cited chunks and keep only uncited context sources
-  // Also filter by minimum relevance to avoid noise
-  const uncitedChunks = allChunks.filter(chunk =>
-    !citedChunkIds.has(chunk.chunkId) && chunk.score >= CONTEXT_SOURCE_MIN_RELEVANCE
-  );
+  const uncitedChunks = allChunks
+    .filter(chunk => !citedChunkIds.has(chunk.chunkId) && chunk.score >= CONTEXT_SOURCE_CONFIG.MIN_RELEVANCE)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, CONTEXT_SOURCE_CONFIG.MAX_COUNT);
 
-  // Sort by score (highest first) to show most relevant context sources first
-  uncitedChunks.sort((a, b) => b.score - a.score);
-
-  // Limit count for cleaner responses
-  const topChunks = uncitedChunks.slice(0, CONTEXT_SOURCE_MAX_COUNT);
-
-  // Convert to Source objects with sequential IDs
-  return topChunks.map((chunk, index) => {
-    const preview = chunk.text.length > 120 ? chunk.text.slice(0, 117) + '...' : chunk.text;
-    return {
-      id: String(startId + index),
-      noteId: chunk.noteId,
-      preview,
-      date: chunk.createdAt.toLocaleDateString('en-US', {
-        month: 'short',
-        day: 'numeric',
-        year: 'numeric',
-      }),
-      relevance: Math.round(chunk.score * 100) / 100,
-    };
-  });
+  return uncitedChunks.map((chunk, index) => ({
+    id: String(startId + index),
+    noteId: chunk.noteId,
+    preview: chunk.text.length > 120 ? chunk.text.slice(0, 117) + '...' : chunk.text,
+    date: chunk.createdAt.toLocaleDateString('en-US', DATE_FORMAT_OPTIONS),
+    relevance: Math.round(chunk.score * 100) / 100,
+  }));
 }
 
-/**
- * Determine confidence level based on citation coverage and scores
- *
- * Uses a multi-factor approach:
- * 1. If LLM expresses uncertainty → 'none'
- * 2. If no citations → 'none'
- * 3. Otherwise, use enhanced confidence breakdown
- *
- * Thresholds calibrated to match enhanced confidence levels:
- * - high: overall >= 0.70 (was too strict at 0.7 score requirement)
- * - medium: overall >= 0.50
- * - low: everything else
- */
+// =============================================================================
+// Confidence Calculation
+// =============================================================================
+
+/** Determine confidence level based on citation coverage and scores */
 function calculateConfidence(
   citationCount: number,
   sourceCount: number,
@@ -427,7 +403,7 @@ function calculateConfidence(
 ): ConfidenceLevel {
   if (looksLikeUncertainty || citationCount === 0) return 'none';
 
-  // If enhanced confidence is available, map it to ConfidenceLevel
+  // Map enhanced confidence to ConfidenceLevel
   if (enhancedLevel) {
     switch (enhancedLevel) {
       case 'very_high':
@@ -441,60 +417,65 @@ function calculateConfidence(
     }
   }
 
-  // Fallback to legacy calculation with relaxed thresholds
+  // Fallback to legacy calculation
   const coverage = sourceCount > 0 ? citationCount / sourceCount : 0;
   if (coverage >= 0.4 && avgScore >= 0.5) return 'high';
   if (coverage >= 0.2 && avgScore >= 0.3) return 'medium';
   return 'low';
 }
 
-/**
- * Normalize citation format from [N#] to [#] for cleaner display
- */
+/** Normalize citation format from [N#] to [#] for cleaner display */
 function normalizeCitationFormat(answer: string): string {
   return answer.replace(/\[N(\d+)\]/g, '[$1]');
 }
 
-/**
- * Get intent-specific formatting guidance for cleaner output
- */
+// =============================================================================
+// Prompt Building
+// =============================================================================
+
+/** Intent-specific formatting guidance */
+const INTENT_GUIDANCE: Record<QueryIntent, { format: string; tone: string }> = {
+  summarize: {
+    format: 'Start with a one-sentence overview, then use bullet points (•) for 2-4 key details.',
+    tone: 'Synthesize information naturally. Avoid repeating the same facts.',
+  },
+  list: {
+    format: 'Use bullet points (•) or numbers. One item per line. Group related items together.',
+    tone: 'Be scannable and organized.',
+  },
+  decision: {
+    format: 'State the decision clearly first. Then explain the reasoning in 1-2 sentences.',
+    tone: 'Be definitive. Use "decided to" or "chose" language.',
+  },
+  action_item: {
+    format: 'Use bullet points (•) for each action. Include who/when if mentioned in notes.',
+    tone: 'Be actionable and clear.',
+  },
+  question: {
+    format: 'Answer directly in the first sentence. Add brief context only if it helps understanding.',
+    tone: 'Be conversational but precise.',
+  },
+  search: {
+    format: 'Write 1-3 short paragraphs. Use bullet points if listing multiple related items.',
+    tone: 'Be helpful and natural.',
+  },
+};
+
+/** Get intent-specific formatting guidance */
 function getIntentGuidance(intent: QueryIntent): { format: string; tone: string } {
-  switch (intent) {
-    case 'summarize':
-      return {
-        format: 'Start with a one-sentence overview, then use bullet points (•) for 2-4 key details.',
-        tone: 'Synthesize information naturally. Avoid repeating the same facts.',
-      };
-    case 'list':
-      return {
-        format: 'Use bullet points (•) or numbers. One item per line. Group related items together.',
-        tone: 'Be scannable and organized.',
-      };
-    case 'decision':
-      return {
-        format: 'State the decision clearly first. Then explain the reasoning in 1-2 sentences.',
-        tone: 'Be definitive. Use "decided to" or "chose" language.',
-      };
-    case 'action_item':
-      return {
-        format: 'Use bullet points (•) for each action. Include who/when if mentioned in notes.',
-        tone: 'Be actionable and clear.',
-      };
-    case 'question':
-      return {
-        format: 'Answer directly in the first sentence. Add brief context only if it helps understanding.',
-        tone: 'Be conversational but precise.',
-      };
-    default:
-      return {
-        format: 'Write 1-3 short paragraphs. Use bullet points if listing multiple related items.',
-        tone: 'Be helpful and natural.',
-      };
-  }
+  return INTENT_GUIDANCE[intent] || INTENT_GUIDANCE.search;
 }
 
-// Pre-built prompt template parts (avoid string concatenation in hot path)
-const PROMPT_TEMPLATE_START = `You are a helpful assistant answering questions from the user's personal notes.
+/** Date format options for consistent date display */
+const DATE_FORMAT_OPTIONS: Intl.DateTimeFormatOptions = {
+  month: 'short',
+  day: 'numeric',
+  year: 'numeric',
+};
+
+/** Pre-built prompt template parts */
+const PROMPT_TEMPLATES = {
+  START: `You are a helpful assistant answering questions from the user's personal notes.
 
 ## Your Task
 Answer the user's question using ONLY the information in the sources below. If the sources don't contain relevant information, say "I don't have notes about that."
@@ -512,27 +493,12 @@ Answer the user's question using ONLY the information in the sources below. If t
 - Example: "React Hooks let you use state in functional components. useState manages local state, while useEffect handles side effects like API calls. [N1]"
 
 ## Formatting
-`;
-
-const PROMPT_TEMPLATE_SOURCES = `
-
-## Sources (`;
-const PROMPT_TEMPLATE_QUESTION = ` total)
-`;
-const PROMPT_TEMPLATE_END = `
-
-## Question
-`;
-const PROMPT_TEMPLATE_ANSWER = `
-
-## Answer`;
-
-// Cache date format options to avoid repeated object creation
-const DATE_FORMAT_OPTIONS: Intl.DateTimeFormatOptions = {
-  month: 'short',
-  day: 'numeric',
-  year: 'numeric',
-};
+`,
+  SOURCES: `\n\n## Sources (`,
+  QUESTION: ` total)\n`,
+  END: `\n\n## Question\n`,
+  ANSWER: `\n\n## Answer`,
+} as const;
 
 /**
  * Build an optimized RAG prompt with clean formatting instructions.
@@ -571,28 +537,25 @@ export function buildPrompt(
 
   const sourcesText = sourceParts.join('\n\n');
 
-  // Build final prompt using pre-built template parts
-  return PROMPT_TEMPLATE_START +
+  return PROMPT_TEMPLATES.START +
     guidance.format + '\n' +
     guidance.tone +
-    PROMPT_TEMPLATE_SOURCES +
+    PROMPT_TEMPLATES.SOURCES +
     sourceCount +
-    PROMPT_TEMPLATE_QUESTION +
+    PROMPT_TEMPLATES.QUESTION +
     sourcesText +
-    PROMPT_TEMPLATE_END +
+    PROMPT_TEMPLATES.END +
     query +
-    PROMPT_TEMPLATE_ANSWER;
+    PROMPT_TEMPLATES.ANSWER;
 }
 
-// NOTE: Citation validation functions (validateCitations, extractVerificationKeywords,
-// calculateOverlapScore, verifyCitationRelevance) have been consolidated into
-// src/citationValidator.ts as the single canonical validation module.
-// Use validateCitationsWithChunks() for all citation validation.
+// =============================================================================
+// Citation Cleanup
+// =============================================================================
 
-/**
- * Find citation references in the answer that don't map to valid citations.
- * Returns array of dangling reference strings like ["N5", "N7"]
- */
+// NOTE: Citation validation functions consolidated in src/citationValidator.ts
+
+/** Find citation references that don't map to valid citations */
 function findDanglingCitationReferences(answer: string, validCitations: Citation[]): string[] {
   const validCids = new Set(validCitations.map(c => c.cid));
   const citationPattern = /\[N(\d+)\]/g;
@@ -601,48 +564,32 @@ function findDanglingCitationReferences(answer: string, validCitations: Citation
   let match;
   while ((match = citationPattern.exec(answer)) !== null) {
     const cid = `N${match[1]}`;
-    if (!validCids.has(cid)) {
-      danglingRefs.push(cid);
-    }
+    if (!validCids.has(cid)) danglingRefs.push(cid);
   }
 
-  // Return unique dangling refs
   return [...new Set(danglingRefs)];
 }
 
-/**
- * Remove dangling citation references from the answer.
- * Cleans up [N#] patterns that don't map to valid citations.
- */
+/** Remove dangling citation references from the answer */
 function removeDanglingReferences(answer: string, danglingRefs: string[]): string {
   let cleaned = answer;
   for (const ref of danglingRefs) {
-    // Remove the [N#] pattern, handling multiple occurrences
-    const pattern = new RegExp(`\\[${ref}\\]`, 'g');
-    cleaned = cleaned.replace(pattern, '');
+    cleaned = cleaned.replace(new RegExp(`\\[${ref}\\]`, 'g'), '');
   }
-  // Clean up any double spaces left behind
-  cleaned = cleaned.replace(/  +/g, ' ').trim();
-  return cleaned;
+  return cleaned.replace(/  +/g, ' ').trim();
 }
 
-/**
- * Build a repair prompt to fix missing or invalid citations
- * Provides specific feedback about what needs to be fixed
- */
+/** Build a repair prompt to fix missing or invalid citations */
 function buildCitationRepairPrompt(
   originalAnswer: string,
   citations: Map<string, Citation>,
-  invalidCids?: string[] // Optional: list of invalid citation IDs to remove
+  invalidCids?: string[]
 ): string {
   const citationList = Array.from(citations.entries())
-    .map(([cid, c]) => {
-      return `[${cid}]: "${c.snippet.slice(0, 200)}${c.snippet.length > 200 ? '...' : ''}"`;
-    })
+    .map(([cid, c]) => `[${cid}]: "${c.snippet.slice(0, 200)}${c.snippet.length > 200 ? '...' : ''}"`)
     .join('\n');
 
-  // Build feedback about invalid citations if provided
-  const invalidFeedback = invalidCids && invalidCids.length > 0
+  const invalidFeedback = invalidCids?.length
     ? `\nPROBLEM: The following citations are INVALID and must be removed or replaced: ${invalidCids.join(', ')}\nThese citations do not match their claimed source content.\n`
     : '';
 
@@ -664,9 +611,11 @@ STRICT RULES:
 REWRITE WITH CORRECT CITATIONS:`;
 }
 
-/**
- * Generate chat response with RAG
- */
+// =============================================================================
+// Main Chat Function
+// =============================================================================
+
+/** Generate chat response with RAG */
 export async function generateChatResponse(request: ChatRequest): Promise<ChatResponse> {
   const startTime = Date.now();
 
@@ -760,13 +709,9 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
   let systemInstruction: string | undefined;
   let responseFormat: ResponseFormat | undefined;
 
-  if (AGENTIC_PROMPTS_ENABLED) {
+  if (FEATURES.AGENTIC_PROMPTS) {
     // Agentic prompts: intelligent response generation with format optimization
-    const agenticResult = buildCompleteAgenticPrompt(
-      query,
-      chunks,
-      queryAnalysis.intent
-    );
+    const agenticResult = buildCompleteAgenticPrompt(query, chunks, queryAnalysis.intent);
     systemInstruction = agenticResult.systemPrompt;
     prompt = agenticResult.userPrompt;
     responseFormat = agenticResult.format;
@@ -776,13 +721,9 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
       format: responseFormat,
       sourceCount,
     });
-  } else if (ENHANCED_PROMPTS_ENABLED) {
+  } else if (FEATURES.ENHANCED_PROMPTS) {
     // Enhanced v2 prompts: separate system instruction + user prompt
-    const { systemPrompt, userPrompt } = buildCompleteEnhancedPrompt(
-      query,
-      chunks,
-      queryAnalysis.intent
-    );
+    const { systemPrompt, userPrompt } = buildCompleteEnhancedPrompt(query, chunks, queryAnalysis.intent);
     systemInstruction = systemPrompt;
     prompt = userPrompt;
   } else {
@@ -891,9 +832,8 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
     cleanedAnswer.toLowerCase().includes("no information");
 
   // Calculate citation coverage using sourceCount (== citationsMap.size)
-  // This ensures we compute coverage against the EXACT number of sources in the prompt
   const citationCoverage = sourceCount > 0 ? usedCitations.length / sourceCount : 1;
-  const hasLowCoverage = sourceCount >= 3 && citationCoverage < MIN_CITATION_COVERAGE && !looksLikeUncertainty;
+  const hasLowCoverage = sourceCount >= 3 && citationCoverage < CITATION_THRESHOLDS.MIN_COVERAGE && !looksLikeUncertainty;
 
   // Also trigger repair if validation removed invalid citations
   const invalidCidsFromValidation = validationResult.invalidCitationsRemoved.concat(validationResult.droppedCitations);
@@ -1022,9 +962,9 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
 
   const postProcessStart = Date.now();
 
-  // 0. Run unified citation verification pipeline (new enhanced verification)
+  // Run unified citation verification pipeline
   let pipelineResult;
-  if (UNIFIED_PIPELINE_ENABLED) {
+  if (FEATURES.UNIFIED_PIPELINE) {
     try {
       pipelineResult = await runUnifiedCitationPipeline(
         cleanedAnswer,
@@ -1033,7 +973,6 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
         queryAnalysis.intent
       );
 
-      // Log pipeline results
       logInfo('Unified pipeline verification complete', {
         overallConfidence: Math.round(pipelineResult.overallConfidence * 100) / 100,
         citationAccuracy: Math.round(pipelineResult.citationAccuracy * 100) / 100,
@@ -1044,11 +983,9 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
         processingTimeMs: pipelineResult.processingTimeMs,
       });
 
-      // Use validated output from pipeline
       cleanedAnswer = pipelineResult.validatedAnswer;
       usedCitations = pipelineResult.validatedCitations;
 
-      // Update quality flags based on pipeline results
       if (pipelineResult.invalidCitationsRemoved.length > 0) {
         qualityFlags.potentialHallucinations = true;
       }
@@ -1061,8 +998,8 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
     }
   }
 
-  // 1. Enforce response consistency (new)
-  if (CONSISTENCY_ENFORCEMENT_ENABLED) {
+  // Enforce response consistency
+  if (FEATURES.CONSISTENCY_ENFORCEMENT) {
     const { correctedAnswer, result: consistencyResult } = enforceResponseConsistency(
       cleanedAnswer,
       queryAnalysis.intent
@@ -1270,12 +1207,12 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
     },
   });
 
-  // Warn if coverage is below strict threshold (helps identify issues in production)
-  if (finalCoverage < MIN_CITATION_COVERAGE_STRICT * 100 && sourceCount >= 3 && !looksLikeUncertainty) {
+  // Warn if coverage is below strict threshold
+  if (finalCoverage < CITATION_THRESHOLDS.MIN_COVERAGE_STRICT * 100 && sourceCount >= 3 && !looksLikeUncertainty) {
     logWarn('Low citation coverage detected', {
       requestId: retrievalLog.requestId,
       coverage: `${finalCoverage}%`,
-      threshold: `${MIN_CITATION_COVERAGE_STRICT * 100}%`,
+      threshold: `${CITATION_THRESHOLDS.MIN_COVERAGE_STRICT * 100}%`,
       citationCount: usedCitations.length,
       sourceCount,
       query: query.slice(0, 100),
@@ -1334,7 +1271,7 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
     (chunks.length > 0 && chunks[0].score >= 0.35);
 
   const contextSources = hasRelevantContext
-    ? buildContextSources(chunks, citedChunkIds, lastCitedId + 1, queryTerms)
+    ? buildContextSources(chunks, citedChunkIds, lastCitedId + 1)
     : [];
 
   // Get enhanced confidence summary
@@ -1463,26 +1400,25 @@ export function buildConversationContext(history: ConversationMessage[], maxMess
   return `\n--- Conversation History ---\n${parts.join('\n\n')}\n--- End History ---\n\n`;
 }
 
+/** Response format instructions */
+const FORMAT_INSTRUCTIONS: Record<ResponseFormatType, string> = {
+  concise: 'Be concise - aim for 2-3 sentences maximum. Get straight to the point.',
+  detailed: 'Provide a comprehensive answer with full context and explanations.',
+  bullet: 'Format your response as a bulleted list with clear, actionable points.',
+  structured: 'Use markdown formatting with headers, bullet points, and emphasis where appropriate.',
+  default: 'Respond naturally and conversationally.',
+};
+
 /** Get response format instructions */
 function getResponseFormatInstructions(format: ResponseFormatType = 'default'): string {
-  switch (format) {
-    case 'concise':
-      return 'Be concise - aim for 2-3 sentences maximum. Get straight to the point.';
-    case 'detailed':
-      return 'Provide a comprehensive answer with full context and explanations.';
-    case 'bullet':
-      return 'Format your response as a bulleted list with clear, actionable points.';
-    case 'structured':
-      return 'Use markdown formatting with headers, bullet points, and emphasis where appropriate.';
-    case 'default':
-    default:
-      return 'Respond naturally and conversationally.';
-  }
+  return FORMAT_INSTRUCTIONS[format] || FORMAT_INSTRUCTIONS.default;
 }
 
-/**
- * Generate enhanced chat response with conversation context, filters, and format options
- */
+// =============================================================================
+// Enhanced Chat Function
+// =============================================================================
+
+/** Generate enhanced chat response with conversation context, filters, and format options */
 export async function generateEnhancedChatResponse(request: EnhancedChatRequest): Promise<ChatResponse> {
   const startTime = Date.now();
 
@@ -1633,12 +1569,10 @@ export async function generateEnhancedChatResponse(request: EnhancedChatRequest)
   // Extract and validate citations
   const allCitations = Array.from(sourcesPack.citationsMap.values());
   let validCitations = allCitations;
-  let invalidRemoved = 0;
 
   if (verifyCitations) {
     const validation = validateCitationsWithChunks(answer, allCitations, chunks);
     validCitations = validation.validatedCitations;
-    invalidRemoved = validation.invalidCitationsRemoved.length;
   }
 
   // Build sources for response
@@ -1647,7 +1581,7 @@ export async function generateEnhancedChatResponse(request: EnhancedChatRequest)
   // Build context sources if requested
   const citedChunkIds = new Set(validCitations.map(c => c.chunkId));
   const contextSources = includeContextSources
-    ? buildContextSources(chunks, citedChunkIds, validCitations.length + 1, queryTerms)
+    ? buildContextSources(chunks, citedChunkIds, validCitations.length + 1)
     : undefined;
 
   // Calculate confidence using existing function

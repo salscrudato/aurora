@@ -1,137 +1,65 @@
 /**
- * AuroraNotes API - Query Expansion Module
- * 
- * Uses Gemini to generate multiple query variations for improved recall.
- * This is an optional feature behind the QUERY_EXPANSION_ENABLED flag.
- * 
- * Multi-query expansion helps with:
- * - Synonym coverage (e.g., "meeting" → "call", "discussion", "sync")
- * - Phrasing variations (e.g., "how to X" → "steps for X", "X tutorial")
- * - Entity normalization (e.g., "AWS" → "Amazon Web Services")
+ * Query Expansion - Uses Gemini to generate query variations for improved recall
  */
 
 import { getGenAIClient, isGenAIAvailable } from "./genaiClient";
-import { logInfo, logError, logWarn } from "./utils";
+import { logInfo, logError } from "./utils";
 import { QUERY_EXPANSION_ENABLED, QUERY_EXPANSION_REWRITES, QUERY_EXPANSION_TTL_MS, QUERY_EXPANSION_MODEL } from "./config";
 
-// Cache for expanded queries to avoid repeated LLM calls
-const expansionCache = new Map<string, { variants: string[]; timestamp: number }>();
+const cache = new Map<string, { variants: string[]; timestamp: number }>();
 const MAX_CACHE_SIZE = 100;
 
-// Expansion prompt template
-const EXPANSION_PROMPT = `You are a query expansion assistant for a personal notes search system.
+const PROMPT = `Generate ${QUERY_EXPANSION_REWRITES} alternative phrasings for this search query. Keep same meaning, use synonyms, try different phrasings. Return ONLY variants, one per line.
 
-Given a user's search query, generate ${QUERY_EXPANSION_REWRITES} alternative phrasings that would help find relevant notes.
+Query: "{query}"
 
-Rules:
-1. Keep the same semantic meaning
-2. Use synonyms and related terms
-3. Try different phrasings (questions, statements, keywords)
-4. Include any acronym expansions or abbreviations
-5. Keep each variant concise (under 50 words)
-6. Return ONLY the variants, one per line, no numbering or bullets
+Alternatives:`;
 
-User query: "{query}"
+export const isQueryExpansionAvailable = (): boolean => QUERY_EXPANSION_ENABLED && isGenAIAvailable();
 
-Alternative phrasings:`;
-
-/**
- * Check if query expansion is available
- */
-export function isQueryExpansionAvailable(): boolean {
-  return QUERY_EXPANSION_ENABLED && isGenAIAvailable();
-}
-
-/**
- * Get cache key for a query
- */
-function getCacheKey(query: string): string {
-  return query.toLowerCase().trim();
-}
-
-/**
- * Evict old cache entries
- */
-function evictOldCacheEntries(): void {
+function evictCache(): void {
   const now = Date.now();
-  for (const [key, value] of expansionCache.entries()) {
-    if (now - value.timestamp > QUERY_EXPANSION_TTL_MS) {
-      expansionCache.delete(key);
-    }
+  for (const [key, { timestamp }] of cache.entries()) {
+    if (now - timestamp > QUERY_EXPANSION_TTL_MS) cache.delete(key);
   }
-  
-  // Also evict if cache is too large
-  if (expansionCache.size > MAX_CACHE_SIZE) {
-    const entries = Array.from(expansionCache.entries());
-    entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
-    const toDelete = entries.slice(0, entries.length - MAX_CACHE_SIZE);
-    for (const [key] of toDelete) {
-      expansionCache.delete(key);
-    }
+  if (cache.size > MAX_CACHE_SIZE) {
+    const sorted = [...cache.entries()].sort((a, b) => a[1].timestamp - b[1].timestamp);
+    sorted.slice(0, sorted.length - MAX_CACHE_SIZE).forEach(([k]) => cache.delete(k));
   }
 }
 
-/**
- * Expand a query into multiple variants using Gemini
- * 
- * @param query - Original user query
- * @returns Array of query variants (including original)
- */
 export async function expandQuery(query: string): Promise<string[]> {
-  if (!isQueryExpansionAvailable()) {
-    return [query];
-  }
+  if (!isQueryExpansionAvailable()) return [query];
 
-  const cacheKey = getCacheKey(query);
-  
-  // Check cache
-  const cached = expansionCache.get(cacheKey);
+  const key = query.toLowerCase().trim();
+  const cached = cache.get(key);
   if (cached && Date.now() - cached.timestamp < QUERY_EXPANSION_TTL_MS) {
     logInfo('Query expansion cache hit', { query: query.slice(0, 50) });
     return cached.variants;
   }
 
-  const startTime = Date.now();
-
   try {
-    const client = getGenAIClient();
-    const prompt = EXPANSION_PROMPT.replace('{query}', query);
-
-    const response = await client.models.generateContent({
+    const response = await getGenAIClient().models.generateContent({
       model: QUERY_EXPANSION_MODEL,
-      contents: prompt,
-      config: {
-        temperature: 0.7, // Some creativity for variations
-        maxOutputTokens: 200,
-      },
+      contents: PROMPT.replace('{query}', query),
+      config: { temperature: 0.7, maxOutputTokens: 200 },
     });
 
-    const text = response.text?.trim() || '';
-    
-    // Parse variants from response
-    const variants = text
+    const variants = (response.text?.trim() || '')
       .split('\n')
-      .map(line => line.trim())
-      .filter(line => line.length > 0 && line.length < 200)
+      .map(l => l.trim())
+      .filter(l => l.length > 0 && l.length < 200)
       .slice(0, QUERY_EXPANSION_REWRITES);
 
-    // Always include original query first
     const allVariants = [query, ...variants.filter(v => v.toLowerCase() !== query.toLowerCase())];
 
-    // Cache the result
-    evictOldCacheEntries();
-    expansionCache.set(cacheKey, { variants: allVariants, timestamp: Date.now() });
-
-    logInfo('Query expansion complete', {
-      originalQuery: query.slice(0, 50),
-      variantCount: allVariants.length,
-      elapsedMs: Date.now() - startTime,
-    });
+    evictCache();
+    cache.set(key, { variants: allVariants, timestamp: Date.now() });
+    logInfo('Query expanded', { variantCount: allVariants.length });
 
     return allVariants;
   } catch (err) {
     logError('Query expansion failed', err);
-    return [query]; // Fallback to original query
+    return [query];
   }
 }
-

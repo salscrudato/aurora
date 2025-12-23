@@ -1,23 +1,10 @@
 /**
- * AuroraNotes API - Response Post-Processor
- *
- * Ensures consistent response formatting, citation placement,
- * and answer structure based on query intent.
- *
- * Features:
- * - Citation normalization and deduplication
- * - Response structure enforcement
- * - Format consistency (lists, paragraphs, etc.)
- * - Citation placement optimization
- * - Answer coherence validation
+ * Response Post-Processor - Citation normalization, formatting, and validation
  */
 
-import { Citation, ScoredChunk, QueryIntent } from './types';
+import { Citation, QueryIntent } from './types';
 import { logInfo, logWarn } from './utils';
 
-/**
- * Post-processing configuration
- */
 export interface PostProcessorConfig {
   normalizeCitations: boolean;
   enforceStructure: boolean;
@@ -36,9 +23,6 @@ const DEFAULT_CONFIG: PostProcessorConfig = {
   preferredFormat: 'auto',
 };
 
-/**
- * Post-processed response result
- */
 export interface PostProcessedResponse {
   originalAnswer: string;
   processedAnswer: string;
@@ -48,306 +32,128 @@ export interface PostProcessedResponse {
   structureType: 'paragraph' | 'list' | 'structured' | 'mixed';
 }
 
-/**
- * Normalize citation format to consistent [N1], [N2], etc.
- */
+const clamp = (n: number, min = 0, max = 1) => Math.max(min, Math.min(max, n));
+const splitSentences = (text: string) => text.split(/(?<=[.!?])\s+/);
+
 function normalizeCitationFormat(text: string): { text: string; mapping: Map<string, string> } {
   const mapping = new Map<string, string>();
-  let citationCounter = 1;
+  const seen = new Set<string>();
+  let counter = 1;
 
-  // Find all citation patterns
-  const citationPattern = /\[(?:N)?(\d+)\]/g;
-  const usedCids = new Set<string>();
-
-  // First pass: collect all unique citations
-  let match;
-  while ((match = citationPattern.exec(text)) !== null) {
-    const originalCid = match[0];
-    if (!usedCids.has(originalCid)) {
-      usedCids.add(originalCid);
-      const normalizedCid = `[N${citationCounter}]`;
-      mapping.set(originalCid, normalizedCid);
-      citationCounter++;
+  for (const match of text.matchAll(/\[(?:N)?(\d+)\]/g)) {
+    if (!seen.has(match[0])) {
+      seen.add(match[0]);
+      mapping.set(match[0], `[N${counter++}]`);
     }
   }
 
-  // Second pass: replace all citations with normalized format
-  let normalizedText = text;
-  for (const [original, normalized] of mapping) {
-    normalizedText = normalizedText.split(original).join(normalized);
-  }
-
-  return { text: normalizedText, mapping };
+  let result = text;
+  for (const [orig, norm] of mapping) result = result.split(orig).join(norm);
+  return { text: result, mapping };
 }
 
-/**
- * Deduplicate adjacent citations
- */
-function deduplicateAdjacentCitations(text: string): string {
-  // Remove duplicate adjacent citations like [N1][N1]
-  return text.replace(/(\[N\d+\])(\s*\1)+/g, '$1');
-}
+const dedupeAdjacent = (text: string) => text.replace(/(\[N\d+\])(\s*\1)+/g, '$1');
 
-/**
- * Limit citations per sentence
- */
-function limitCitationsPerSentence(text: string, maxCitations: number): string {
-  const sentences = text.split(/(?<=[.!?])\s+/);
-
-  return sentences.map(sentence => {
-    const citations = sentence.match(/\[N\d+\]/g) || [];
-    if (citations.length <= maxCitations) return sentence;
-
-    // Keep only the first maxCitations citations
+function limitCitationsPerSentence(text: string, max: number): string {
+  return splitSentences(text).map(s => {
+    const cites = s.match(/\[N\d+\]/g) || [];
+    if (cites.length <= max) return s;
     let count = 0;
-    return sentence.replace(/\[N\d+\]/g, (match) => {
-      count++;
-      return count <= maxCitations ? match : '';
-    }).replace(/\s+/g, ' ').trim();
+    return s.replace(/\[N\d+\]/g, m => ++count <= max ? m : '').replace(/\s+/g, ' ').trim();
   }).join(' ');
 }
 
-/**
- * Detect the structure type of a response
- */
-function detectStructureType(text: string): PostProcessedResponse['structureType'] {
+function detectStructure(text: string): PostProcessedResponse['structureType'] {
   const lines = text.split('\n').filter(l => l.trim());
-
-  // Check for list patterns
-  const listPatterns = /^[\s]*[-*•]\s|^[\s]*\d+[.)]\s|^[\s]*[a-z][.)]\s/i;
-  const listLines = lines.filter(l => listPatterns.test(l)).length;
-
-  // Check for structured patterns (headers, sections)
-  const headerPatterns = /^#+\s|^[A-Z][^.!?]*:$/;
-  const headerLines = lines.filter(l => headerPatterns.test(l)).length;
-
-  if (headerLines > 0 && listLines > 0) return 'structured';
+  const listLines = lines.filter(l => /^[\s]*[-*•]\s|^[\s]*\d+[.)]\s/i.test(l)).length;
+  const headerLines = lines.filter(l => /^#+\s|^[A-Z][^.!?]*:$/.test(l)).length;
+  if (headerLines && listLines) return 'structured';
   if (listLines > lines.length * 0.5) return 'list';
-  if (headerLines > 0) return 'structured';
-  if (lines.length <= 3) return 'paragraph';
-
-  return 'mixed';
+  if (headerLines) return 'structured';
+  return lines.length <= 3 ? 'paragraph' : 'mixed';
 }
 
-/**
- * Determine preferred format based on query intent
- */
-function getPreferredFormat(intent: QueryIntent): PostProcessorConfig['preferredFormat'] {
-  switch (intent) {
-    case 'question':
-      return 'paragraph';
-    case 'list':
-    case 'action_item':
-      return 'list';
-    case 'decision':
-      return 'structured';
-    case 'summarize':
-      return 'structured';
-    case 'search':
-    default:
-      return 'auto';
-  }
-}
+const INTENT_FORMAT: Record<QueryIntent, PostProcessorConfig['preferredFormat']> = {
+  question: 'paragraph', list: 'list', action_item: 'list',
+  decision: 'structured', summarize: 'structured', search: 'auto',
+};
 
-/**
- * Calculate coherence score based on various factors
- */
-function calculateCoherenceScore(text: string, _citations: Citation[]): number {
+function calcCoherence(text: string): number {
   let score = 1.0;
-
-  // Penalize for orphaned citations (citations without context)
-  const orphanedPattern = /^\s*\[N\d+\]\s*$/gm;
-  const orphanedCount = (text.match(orphanedPattern) || []).length;
-  score -= orphanedCount * 0.1;
-
-  // Penalize for citation clusters (too many citations in one place)
-  const clusterPattern = /(\[N\d+\]\s*){4,}/g;
-  const clusterCount = (text.match(clusterPattern) || []).length;
-  score -= clusterCount * 0.15;
-
-  // Reward for even citation distribution
-  const sentences = text.split(/(?<=[.!?])\s+/);
-  const citedSentences = sentences.filter(s => /\[N\d+\]/.test(s)).length;
-  const citationDistribution = sentences.length > 0 ? citedSentences / sentences.length : 0;
-  if (citationDistribution > 0.3 && citationDistribution < 0.8) {
-    score += 0.1;
-  }
-
-  return Math.max(0, Math.min(1, score));
+  score -= ((text.match(/^\s*\[N\d+\]\s*$/gm) || []).length) * 0.1;  // orphaned
+  score -= ((text.match(/(\[N\d+\]\s*){4,}/g) || []).length) * 0.15; // clusters
+  const sentences = splitSentences(text);
+  const cited = sentences.filter(s => /\[N\d+\]/.test(s)).length;
+  const dist = sentences.length ? cited / sentences.length : 0;
+  if (dist > 0.3 && dist < 0.8) score += 0.1;
+  return clamp(score);
 }
 
-/**
- * Update citation references in citations array based on mapping
- */
-function remapCitations(
-  citations: Citation[],
-  mapping: Map<string, string>
-): Citation[] {
-  const reverseMapping = new Map<string, string>();
-  for (const [original, normalized] of mapping) {
-    // Extract the number from [N1] format
-    const originalNum = original.match(/\d+/)?.[0];
-    const normalizedNum = normalized.match(/\d+/)?.[0];
-    if (originalNum && normalizedNum) {
-      reverseMapping.set(`N${originalNum}`, `N${normalizedNum}`);
-    }
+function remapCitations(citations: Citation[], mapping: Map<string, string>): Citation[] {
+  const remap = new Map<string, string>();
+  for (const [orig, norm] of mapping) {
+    const oNum = orig.match(/\d+/)?.[0], nNum = norm.match(/\d+/)?.[0];
+    if (oNum && nNum) remap.set(`N${oNum}`, `N${nNum}`);
   }
-
-  return citations.map(citation => {
-    const newCid = reverseMapping.get(citation.cid);
-    if (newCid) {
-      return { ...citation, cid: newCid };
-    }
-    return citation;
-  });
+  return citations.map(c => remap.has(c.cid) ? { ...c, cid: remap.get(c.cid)! } : c);
 }
 
-/**
- * Main post-processing function
- */
 export function postProcessResponse(
-  answer: string,
-  citations: Citation[],
-  queryIntent: QueryIntent,
+  answer: string, citations: Citation[], queryIntent: QueryIntent,
   config: Partial<PostProcessorConfig> = {}
 ): PostProcessedResponse {
-  const fullConfig = { ...DEFAULT_CONFIG, ...config };
-  const modifications: string[] = [];
+  const cfg = { ...DEFAULT_CONFIG, ...config };
+  const mods: string[] = [];
+  let text = answer, cites = [...citations];
 
-  let processedAnswer = answer;
-  let processedCitations = [...citations];
-
-  // Step 1: Normalize citation format
-  if (fullConfig.normalizeCitations) {
-    const { text: normalizedText, mapping } = normalizeCitationFormat(processedAnswer);
-    if (mapping.size > 0) {
-      processedAnswer = normalizedText;
-      processedCitations = remapCitations(processedCitations, mapping);
-      modifications.push(`Normalized ${mapping.size} citation formats`);
-    }
+  if (cfg.normalizeCitations) {
+    const { text: t, mapping } = normalizeCitationFormat(text);
+    if (mapping.size) { text = t; cites = remapCitations(cites, mapping); mods.push(`Normalized ${mapping.size} citations`); }
   }
 
-  // Step 2: Deduplicate adjacent citations
-  if (fullConfig.deduplicateCitations) {
-    const beforeLength = processedAnswer.length;
-    processedAnswer = deduplicateAdjacentCitations(processedAnswer);
-    if (processedAnswer.length !== beforeLength) {
-      modifications.push('Removed duplicate adjacent citations');
-    }
+  if (cfg.deduplicateCitations) {
+    const before = text; text = dedupeAdjacent(text);
+    if (text !== before) mods.push('Removed duplicate citations');
   }
 
-  // Step 3: Limit citations per sentence
-  if (fullConfig.maxCitationsPerSentence > 0) {
-    const beforeAnswer = processedAnswer;
-    processedAnswer = limitCitationsPerSentence(
-      processedAnswer,
-      fullConfig.maxCitationsPerSentence
-    );
-    if (processedAnswer !== beforeAnswer) {
-      modifications.push(`Limited citations to ${fullConfig.maxCitationsPerSentence} per sentence`);
-    }
+  if (cfg.maxCitationsPerSentence > 0) {
+    const before = text; text = limitCitationsPerSentence(text, cfg.maxCitationsPerSentence);
+    if (text !== before) mods.push(`Limited to ${cfg.maxCitationsPerSentence} citations/sentence`);
   }
 
-  // Step 4: Detect and validate structure
-  const structureType = detectStructureType(processedAnswer);
-  const preferredFormat = fullConfig.preferredFormat === 'auto'
-    ? getPreferredFormat(queryIntent)
-    : fullConfig.preferredFormat;
-
-  if (fullConfig.enforceStructure && preferredFormat !== 'auto' && structureType !== preferredFormat) {
-    logInfo('Structure mismatch detected', {
-      detected: structureType,
-      preferred: preferredFormat,
-      queryIntent,
-    });
-    // Note: We log but don't force restructure to avoid breaking the response
+  const structureType = detectStructure(text);
+  const preferred = cfg.preferredFormat === 'auto' ? INTENT_FORMAT[queryIntent] : cfg.preferredFormat;
+  if (cfg.enforceStructure && preferred !== 'auto' && structureType !== preferred) {
+    logInfo('Structure mismatch', { detected: structureType, preferred });
   }
 
-  // Step 5: Calculate coherence score
-  const coherenceScore = fullConfig.validateCoherence
-    ? calculateCoherenceScore(processedAnswer, processedCitations)
-    : 1.0;
+  const coherenceScore = cfg.validateCoherence ? calcCoherence(text) : 1.0;
+  if (coherenceScore < 0.7) logWarn('Low coherence', { coherenceScore });
 
-  if (coherenceScore < 0.7) {
-    logWarn('Low coherence score detected', {
-      coherenceScore,
-      modifications,
-    });
-  }
-
-  return {
-    originalAnswer: answer,
-    processedAnswer,
-    citations: processedCitations,
-    modifications,
-    coherenceScore,
-    structureType,
-  };
+  return { originalAnswer: answer, processedAnswer: text, citations: cites, modifications: mods, coherenceScore, structureType };
 }
 
-/**
- * Quick validation of response quality
- */
-export function validateResponseQuality(
-  answer: string,
-  citations: Citation[]
-): {
-  isValid: boolean;
-  issues: string[];
-  suggestions: string[];
-} {
-  const issues: string[] = [];
-  const suggestions: string[] = [];
+export function validateResponseQuality(answer: string, citations: Citation[]) {
+  const issues: string[] = [], suggestions: string[] = [];
 
-  // Check for empty or very short answers
-  if (answer.trim().length < 20) {
-    issues.push('Answer is too short');
+  if (answer.trim().length < 20) issues.push('Answer too short');
+
+  const sentences = splitSentences(answer);
+  const uncited = sentences.filter(s => s.length > 30 && !/\[N?\d+\]/.test(s));
+  if (uncited.length > sentences.length * 0.5) {
+    issues.push('Most sentences lack citations');
+    suggestions.push('Add citations to support claims');
   }
 
-  // Check for uncited claims (sentences without citations)
-  const sentences = answer.split(/(?<=[.!?])\s+/);
-  const uncitedSentences = sentences.filter(s =>
-    s.length > 30 && !/\[N?\d+\]/.test(s)
-  );
-  if (uncitedSentences.length > sentences.length * 0.5) {
-    issues.push('More than half of sentences lack citations');
-    suggestions.push('Add citations to support key claims');
-  }
+  if (/^[\s\[N\d\]]+$/.test(answer)) issues.push('Only citations, no content');
 
-  // Check for citation-only responses
-  const citationOnlyPattern = /^[\s\[N\d\]]+$/;
-  if (citationOnlyPattern.test(answer)) {
-    issues.push('Response contains only citations without content');
-  }
+  const cited = new Set([...(answer.match(/\[N?(\d+)\]/g) || [])].map(c => c.match(/\d+/)?.[0]));
+  const available = new Set(citations.map(c => c.cid.replace('N', '')));
+  for (const n of cited) if (n && !available.has(n)) issues.push(`[N${n}] references missing source`);
 
-  // Check for broken citation references
-  const citedNumbers = new Set(
-    (answer.match(/\[N?(\d+)\]/g) || []).map(c => c.match(/\d+/)?.[0])
-  );
-  const availableCids = new Set(citations.map(c => c.cid.replace('N', '')));
-  for (const num of citedNumbers) {
-    if (num && !availableCids.has(num)) {
-      issues.push(`Citation [N${num}] references non-existent source`);
-    }
-  }
-
-  return {
-    isValid: issues.length === 0,
-    issues,
-    suggestions,
-  };
+  return { isValid: !issues.length, issues, suggestions };
 }
 
-/**
- * Get post-processor configuration for observability
- */
-export function getPostProcessorConfig(): PostProcessorConfig {
-  return { ...DEFAULT_CONFIG };
-}
-
-/**
- * Response consistency result
- */
 export interface ConsistencyResult {
   isConsistent: boolean;
   toneConsistency: number;
@@ -357,195 +163,68 @@ export interface ConsistencyResult {
   corrections: string[];
 }
 
-/**
- * Enforce consistent response formatting
- * Ensures deterministic output structure
- */
-export function enforceResponseConsistency(
-  answer: string,
-  queryIntent: QueryIntent
-): { correctedAnswer: string; result: ConsistencyResult } {
-  const issues: string[] = [];
-  const corrections: string[] = [];
-  let correctedAnswer = answer;
-
-  // 1. Normalize whitespace and line breaks
-  const beforeWhitespace = correctedAnswer;
-  correctedAnswer = correctedAnswer
-    .replace(/\n{3,}/g, '\n\n')  // Max 2 consecutive newlines
-    .replace(/[ \t]+/g, ' ')     // Single spaces only
-    .trim();
-  if (correctedAnswer !== beforeWhitespace) {
-    corrections.push('Normalized whitespace');
-  }
-
-  // 2. Ensure consistent list formatting
-  const hasNumberedList = /^\s*\d+[.)]\s/m.test(correctedAnswer);
-  const hasBulletList = /^\s*[-*•]\s/m.test(correctedAnswer);
-  if (hasNumberedList && hasBulletList) {
-    issues.push('Mixed list formats (numbered and bullet)');
-    // Convert bullets to numbered if more numbered items
-    const numCount = (correctedAnswer.match(/^\s*\d+[.)]\s/gm) || []).length;
-    const bulletCount = (correctedAnswer.match(/^\s*[-*•]\s/gm) || []).length;
-    if (numCount >= bulletCount) {
-      let counter = numCount + 1;
-      correctedAnswer = correctedAnswer.replace(/^\s*[-*•]\s/gm, () => `${counter++}. `);
-      corrections.push('Converted bullets to numbered list');
-    } else {
-      correctedAnswer = correctedAnswer.replace(/^\s*\d+[.)]\s/gm, '- ');
-      corrections.push('Converted numbered to bullet list');
-    }
-  }
-
-  // 3. Ensure consistent citation format
-  const beforeCitation = correctedAnswer;
-  correctedAnswer = correctedAnswer
-    .replace(/\[\s*N\s*(\d+)\s*\]/g, '[N$1]')  // Normalize spacing
-    .replace(/\[(\d+)\]/g, '[N$1]');           // Ensure N prefix
-  if (correctedAnswer !== beforeCitation) {
-    corrections.push('Normalized citation format');
-  }
-
-  // 4. Remove trailing citation-only sentences
-  const beforeTrailing = correctedAnswer;
-  correctedAnswer = correctedAnswer.replace(/\.\s*(\[N\d+\]\s*)+$/g, '.');
-  if (correctedAnswer !== beforeTrailing) {
-    corrections.push('Removed trailing citation-only content');
-  }
-
-  // 5. Calculate consistency scores
-  const toneConsistency = calculateToneConsistency(correctedAnswer);
-  const formatConsistency = issues.length === 0 ? 1.0 : Math.max(0.5, 1 - issues.length * 0.15);
-  const citationConsistency = calculateCitationConsistency(correctedAnswer);
-
-  const isConsistent = toneConsistency > 0.7 && formatConsistency > 0.7 && citationConsistency > 0.7;
-
-  return {
-    correctedAnswer,
-    result: {
-      isConsistent,
-      toneConsistency,
-      formatConsistency,
-      citationConsistency,
-      issues,
-      corrections,
-    },
-  };
+function calcTone(text: string): number {
+  if (splitSentences(text).filter(s => s.length > 10).length < 2) return 1.0;
+  let issues = 0;
+  if (/\b(therefore|furthermore|moreover|consequently|thus)\b/i.test(text) &&
+      /\b(basically|kind of|sort of|pretty much|gonna|wanna)\b/i.test(text)) issues++;
+  const persons = [/\b(I|my|mine)\b/, /\b(you|your|yours)\b/, /\b(it|they|the user)\b/].filter(p => p.test(text)).length;
+  if (persons > 1) issues += 0.5;
+  return Math.max(0, 1 - issues * 0.2);
 }
 
-/**
- * Calculate tone consistency across the response
- */
-function calculateToneConsistency(text: string): number {
-  const sentences = text.split(/(?<=[.!?])\s+/).filter(s => s.length > 10);
-  if (sentences.length < 2) return 1.0;
-
-  let inconsistencies = 0;
-
-  // Check for tone shifts
-  const formalIndicators = /\b(therefore|furthermore|moreover|consequently|thus)\b/gi;
-  const casualIndicators = /\b(basically|kind of|sort of|pretty much|gonna|wanna)\b/gi;
-
-  const hasFormal = formalIndicators.test(text);
-  const hasCasual = casualIndicators.test(text);
-
-  if (hasFormal && hasCasual) {
-    inconsistencies++;
-  }
-
-  // Check for person consistency (I vs we vs you)
-  const firstPerson = /\b(I|my|mine)\b/g.test(text);
-  const secondPerson = /\b(you|your|yours)\b/g.test(text);
-  const thirdPerson = /\b(it|they|the user|the system)\b/g.test(text);
-
-  const personCount = [firstPerson, secondPerson, thirdPerson].filter(Boolean).length;
-  if (personCount > 1) {
-    inconsistencies += 0.5;
-  }
-
-  return Math.max(0, 1 - inconsistencies * 0.2);
-}
-
-/**
- * Calculate citation placement consistency
- */
-function calculateCitationConsistency(text: string): number {
-  const sentences = text.split(/(?<=[.!?])\s+/).filter(s => s.length > 20);
-  if (sentences.length === 0) return 1.0;
-
+function calcCitationConsistency(text: string): number {
+  const sentences = splitSentences(text).filter(s => s.length > 20);
+  if (!sentences.length) return 1.0;
   let score = 1.0;
-
-  // Check for citation placement consistency
-  const citedSentences = sentences.filter(s => /\[N\d+\]/.test(s));
-  const endCitations = citedSentences.filter(s => /\[N\d+\]\s*[.!?]?\s*$/.test(s));
-  const midCitations = citedSentences.filter(s => /\[N\d+\](?!\s*[.!?]?\s*$)/.test(s));
-
-  // Prefer consistent placement (either mostly end or mostly mid)
-  if (endCitations.length > 0 && midCitations.length > 0) {
-    const ratio = Math.min(endCitations.length, midCitations.length) /
-                  Math.max(endCitations.length, midCitations.length);
-    if (ratio > 0.5) {
-      score -= 0.15; // Inconsistent placement
-    }
-  }
-
-  // Check for citation clustering
-  const clusterPattern = /(\[N\d+\]\s*){4,}/g;
-  const clusterCount = (text.match(clusterPattern) || []).length;
-  score -= clusterCount * 0.1;
-
+  const cited = sentences.filter(s => /\[N\d+\]/.test(s));
+  const atEnd = cited.filter(s => /\[N\d+\]\s*[.!?]?\s*$/.test(s));
+  const mid = cited.filter(s => /\[N\d+\](?!\s*[.!?]?\s*$)/.test(s));
+  if (atEnd.length && mid.length && Math.min(atEnd.length, mid.length) / Math.max(atEnd.length, mid.length) > 0.5) score -= 0.15;
+  score -= ((text.match(/(\[N\d+\]\s*){4,}/g) || []).length) * 0.1;
   return Math.max(0, score);
 }
 
-/**
- * Validate and fix response for production use
- */
-export function validateAndFixResponse(
-  answer: string,
-  citations: Citation[],
-  queryIntent: QueryIntent
-): {
-  finalAnswer: string;
-  finalCitations: Citation[];
-  qualityScore: number;
-  wasModified: boolean;
-} {
-  // Step 1: Post-process response
-  const postProcessed = postProcessResponse(answer, citations, queryIntent);
+export function enforceResponseConsistency(answer: string, _intent: QueryIntent): { correctedAnswer: string; result: ConsistencyResult } {
+  const issues: string[] = [], corrections: string[] = [];
+  let text = answer;
 
-  // Step 2: Enforce consistency
-  const { correctedAnswer, result: consistencyResult } = enforceResponseConsistency(
-    postProcessed.processedAnswer,
-    queryIntent
-  );
+  // Normalize whitespace
+  const ws = text; text = text.replace(/\n{3,}/g, '\n\n').replace(/[ \t]+/g, ' ').trim();
+  if (text !== ws) corrections.push('Normalized whitespace');
 
-  // Step 3: Validate quality
-  const qualityValidation = validateResponseQuality(correctedAnswer, postProcessed.citations);
-
-  // Calculate overall quality score
-  const qualityScore = (
-    postProcessed.coherenceScore * 0.3 +
-    consistencyResult.toneConsistency * 0.25 +
-    consistencyResult.formatConsistency * 0.25 +
-    consistencyResult.citationConsistency * 0.2
-  );
-
-  const wasModified = postProcessed.modifications.length > 0 ||
-                      consistencyResult.corrections.length > 0;
-
-  if (wasModified) {
-    logInfo('Response modified for consistency', {
-      modifications: postProcessed.modifications,
-      corrections: consistencyResult.corrections,
-      qualityScore: Math.round(qualityScore * 100) / 100,
-    });
+  // Unify list formats
+  const hasNum = /^\s*\d+[.)]\s/m.test(text), hasBullet = /^\s*[-*•]\s/m.test(text);
+  if (hasNum && hasBullet) {
+    issues.push('Mixed list formats');
+    const nCount = (text.match(/^\s*\d+[.)]\s/gm) || []).length;
+    const bCount = (text.match(/^\s*[-*•]\s/gm) || []).length;
+    if (nCount >= bCount) {
+      let c = nCount + 1; text = text.replace(/^\s*[-*•]\s/gm, () => `${c++}. `);
+      corrections.push('Unified to numbered list');
+    } else {
+      text = text.replace(/^\s*\d+[.)]\s/gm, '- ');
+      corrections.push('Unified to bullet list');
+    }
   }
 
+  // Normalize citations
+  const cite = text; text = text.replace(/\[\s*N\s*(\d+)\s*\]/g, '[N$1]').replace(/\[(\d+)\]/g, '[N$1]');
+  if (text !== cite) corrections.push('Normalized citations');
+
+  // Remove trailing citations
+  const trail = text; text = text.replace(/\.\s*(\[N\d+\]\s*)+$/g, '.');
+  if (text !== trail) corrections.push('Removed trailing citations');
+
+  const toneConsistency = calcTone(text);
+  const formatConsistency = issues.length ? Math.max(0.5, 1 - issues.length * 0.15) : 1.0;
+  const citationConsistency = calcCitationConsistency(text);
+
   return {
-    finalAnswer: correctedAnswer,
-    finalCitations: postProcessed.citations,
-    qualityScore,
-    wasModified,
+    correctedAnswer: text,
+    result: {
+      isConsistent: toneConsistency > 0.7 && formatConsistency > 0.7 && citationConsistency > 0.7,
+      toneConsistency, formatConsistency, citationConsistency, issues, corrections,
+    },
   };
 }
-

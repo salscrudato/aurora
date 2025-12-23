@@ -1,20 +1,35 @@
 {
   "name": "auroranotes-api",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
-    "build": "tsc",
-    "start": "node dist/index.js"
+  "description": "RAG-powered notes API with advanced retrieval, reranking, and citation grounding",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=20.0.0"
   },
-  "keywords": [],
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "build:clean": "rm -rf dist && tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/*.test.ts",
+    "test:watch": "tsx --test --watch src/*.test.ts",
+    "validate": "npm run typecheck && npm run test",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "rag",
+    "retrieval-augmented-generation",
+    "embeddings",
+    "vector-search",
+    "firebase",
+    "gemini"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "@google-cloud/tasks": "^6.2.1",
     "@google/genai": "^1.33.0",
-    "@types/multer": "^2.0.0",
     "compression": "^1.8.1",
     "cors": "^2.8.5",
     "express": "^5.2.1",
@@ -28,9 +43,10 @@
     "@types/compression": "^1.8.1",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
+    "@types/multer": "^2.0.0",
     "@types/node": "^25.0.2",
     "@types/uuid": "^10.0.0",
-    "ts-node-dev": "^2.0.0",
+    "tsx": "^4.19.0",
     "typescript": "^5.9.3"
   }
 }

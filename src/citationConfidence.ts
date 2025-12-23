@@ -4,7 +4,6 @@
  * Multi-factor citation confidence scoring that combines:
  * - Semantic similarity (embedding-based)
  * - Lexical overlap (keyword-based)
- * - Position-aware scoring (claim location matching)
  * - N-gram overlap for phrase matching
  * - Entity alignment (named entities in claim vs source)
  *
@@ -13,24 +12,57 @@
  */
 
 import { Citation, ScoredChunk } from './types';
-import { cosineSimilarity } from './utils';
+import { cosineSimilarity, logWarn } from './utils';
 import { generateQueryEmbedding, isEmbeddingsAvailable } from './embeddings';
-import { logInfo, logWarn } from './utils';
 
-// Configuration for confidence scoring
-const SEMANTIC_WEIGHT = 0.40;       // Weight for embedding similarity
-const LEXICAL_WEIGHT = 0.25;        // Weight for keyword overlap
-const NGRAM_WEIGHT = 0.20;          // Weight for n-gram phrase matching
-const ENTITY_WEIGHT = 0.15;         // Weight for entity alignment
+// =============================================================================
+// Constants
+// =============================================================================
 
-// Thresholds
+// Scoring weights (must sum to 1.0)
+const SEMANTIC_WEIGHT = 0.40;
+const LEXICAL_WEIGHT = 0.25;
+const NGRAM_WEIGHT = 0.20;
+const ENTITY_WEIGHT = 0.15;
+
+// Confidence thresholds
 const HIGH_CONFIDENCE_THRESHOLD = 0.75;
 const MEDIUM_CONFIDENCE_THRESHOLD = 0.50;
 const MIN_ACCEPTABLE_CONFIDENCE = 0.30;
 
-/**
- * Multi-factor citation confidence score result
- */
+// N-gram weights for phrase matching
+const BIGRAM_WEIGHT = 0.4;
+const TRIGRAM_WEIGHT = 0.6;
+
+// Aggregation settings
+const TOP_CITATIONS_COUNT = 3;
+const LOWEST_THIRD_WEIGHT = 0.4;
+const OVERALL_AVG_WEIGHT = 0.6;
+
+// Intent-specific threshold adjustments
+const INTENT_THRESHOLD_ADJUSTMENTS: Record<string, number> = {
+  factual: 0.05,
+  procedural: 0.0,
+  conceptual: -0.05,
+  comparative: 0.0,
+  exploratory: -0.05,
+  clarification: 0.0,
+  summarize: -0.03,
+  list: 0.0,
+  decision: 0.03,
+  action_item: 0.02,
+  question: 0.0,
+  search: 0.0,
+};
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/** Confidence level for citations */
+export type ConfidenceLevelType = 'high' | 'medium' | 'low' | 'insufficient';
+
+/** Multi-factor citation confidence score result */
 export interface CitationConfidenceScore {
   cid: string;
   claim: string;
@@ -39,29 +71,71 @@ export interface CitationConfidenceScore {
   lexicalScore: number;
   ngramScore: number;
   entityScore: number;
-  confidenceLevel: 'high' | 'medium' | 'low' | 'insufficient';
+  confidenceLevel: ConfidenceLevelType;
   explanation?: string;
 }
 
-/**
- * Extract n-grams from text for phrase matching
- */
-function extractNgrams(text: string, n: number): Set<string> {
-  const words = text.toLowerCase()
+/** Claim-citation pair for batch scoring */
+export interface ClaimCitationPair {
+  claim: string;
+  cid: string;
+}
+
+/** Aggregate confidence score for entire response */
+export interface ResponseConfidenceAggregate {
+  overallScore: number;
+  scoreDistribution: Record<ConfidenceLevelType, number>;
+  weakestCitations: Array<{ cid: string; score: number }>;
+  strongestCitations: Array<{ cid: string; score: number }>;
+  confidenceLevel: ConfidenceLevelType;
+  recommendation: string;
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+/** Round to 3 decimal places for consistent output */
+function round3(value: number): number {
+  return Math.round(value * 1000) / 1000;
+}
+
+/** Normalize text for comparison (lowercase, remove punctuation, split to words) */
+function normalizeToWords(text: string, minLength = 2): string[] {
+  return text
+    .toLowerCase()
     .replace(/[^\w\s]/g, ' ')
     .split(/\s+/)
-    .filter(w => w.length > 1);
+    .filter(w => w.length >= minLength);
+}
 
+// =============================================================================
+// Text Analysis Functions
+// =============================================================================
+
+/** Extract n-grams from text for phrase matching */
+function extractNgrams(text: string, n: number): Set<string> {
+  const words = normalizeToWords(text);
   const ngrams = new Set<string>();
+
   for (let i = 0; i <= words.length - n; i++) {
     ngrams.add(words.slice(i, i + n).join(' '));
   }
   return ngrams;
 }
 
-/**
- * Extract named entities (proper nouns, numbers, dates, identifiers)
- */
+/** Calculate set overlap ratio */
+function calculateSetOverlap(claimSet: Set<string>, sourceSet: Set<string>): number {
+  if (claimSet.size === 0) return 0;
+
+  let overlap = 0;
+  for (const item of claimSet) {
+    if (sourceSet.has(item)) overlap++;
+  }
+  return overlap / claimSet.size;
+}
+
+/** Extract named entities (proper nouns, numbers, dates, identifiers) */
 function extractEntities(text: string): Set<string> {
   const entities = new Set<string>();
 
@@ -84,23 +158,14 @@ function extractEntities(text: string): Set<string> {
   return entities;
 }
 
-/**
- * Calculate lexical overlap score using Jaccard coefficient on keywords
- */
-function calculateLexicalOverlap(claim: string, source: string): number {
-  const claimWords = new Set(
-    claim.toLowerCase()
-      .replace(/[^\w\s]/g, ' ')
-      .split(/\s+/)
-      .filter(w => w.length > 2)
-  );
+// =============================================================================
+// Scoring Functions
+// =============================================================================
 
-  const sourceWords = new Set(
-    source.toLowerCase()
-      .replace(/[^\w\s]/g, ' ')
-      .split(/\s+/)
-      .filter(w => w.length > 2)
-  );
+/** Calculate lexical overlap score using Jaccard coefficient on keywords */
+function calculateLexicalOverlap(claim: string, source: string): number {
+  const claimWords = new Set(normalizeToWords(claim, 3));
+  const sourceWords = new Set(normalizeToWords(source, 3));
 
   if (claimWords.size === 0 || sourceWords.size === 0) return 0;
 
@@ -114,44 +179,31 @@ function calculateLexicalOverlap(claim: string, source: string): number {
   return intersection / union;
 }
 
-/**
- * Calculate n-gram overlap score (bigrams and trigrams)
- */
+/** Calculate n-gram overlap score (bigrams and trigrams) */
 function calculateNgramOverlap(claim: string, source: string): number {
   const claimBigrams = extractNgrams(claim, 2);
   const claimTrigrams = extractNgrams(claim, 3);
   const sourceBigrams = extractNgrams(source, 2);
   const sourceTrigrams = extractNgrams(source, 3);
 
-  let bigramOverlap = 0;
-  for (const bg of claimBigrams) {
-    if (sourceBigrams.has(bg)) bigramOverlap++;
-  }
-
-  let trigramOverlap = 0;
-  for (const tg of claimTrigrams) {
-    if (sourceTrigrams.has(tg)) trigramOverlap++;
-  }
-
-  const bigramScore = claimBigrams.size > 0 ? bigramOverlap / claimBigrams.size : 0;
-  const trigramScore = claimTrigrams.size > 0 ? trigramOverlap / claimTrigrams.size : 0;
+  const bigramScore = calculateSetOverlap(claimBigrams, sourceBigrams);
+  const trigramScore = calculateSetOverlap(claimTrigrams, sourceTrigrams);
 
   // Weight trigrams higher (more specific phrases)
-  return bigramScore * 0.4 + trigramScore * 0.6;
+  return bigramScore * BIGRAM_WEIGHT + trigramScore * TRIGRAM_WEIGHT;
 }
 
-/**
- * Calculate entity alignment score
- */
+/** Calculate entity alignment score */
 function calculateEntityAlignment(claim: string, source: string): number {
   const claimEntities = extractEntities(claim);
   const sourceEntities = extractEntities(source);
 
   if (claimEntities.size === 0) return 1.0; // No entities to verify
 
+  const sourceLower = source.toLowerCase();
   let matches = 0;
   for (const entity of claimEntities) {
-    if (sourceEntities.has(entity) || source.toLowerCase().includes(entity)) {
+    if (sourceEntities.has(entity) || sourceLower.includes(entity)) {
       matches++;
     }
   }
@@ -159,19 +211,34 @@ function calculateEntityAlignment(claim: string, source: string): number {
   return matches / claimEntities.size;
 }
 
-/**
- * Determine confidence level from overall score
- */
-function getConfidenceLevel(score: number): CitationConfidenceScore['confidenceLevel'] {
+/** Determine confidence level from overall score */
+function getConfidenceLevel(score: number): ConfidenceLevelType {
   if (score >= HIGH_CONFIDENCE_THRESHOLD) return 'high';
   if (score >= MEDIUM_CONFIDENCE_THRESHOLD) return 'medium';
   if (score >= MIN_ACCEPTABLE_CONFIDENCE) return 'low';
   return 'insufficient';
 }
 
-/**
- * Score a single claim-citation pair
- */
+/** Compute weighted overall confidence score */
+function computeOverallScore(
+  semanticScore: number,
+  lexicalScore: number,
+  ngramScore: number,
+  entityScore: number
+): number {
+  return (
+    SEMANTIC_WEIGHT * semanticScore +
+    LEXICAL_WEIGHT * lexicalScore +
+    NGRAM_WEIGHT * ngramScore +
+    ENTITY_WEIGHT * entityScore
+  );
+}
+
+// =============================================================================
+// Public API
+// =============================================================================
+
+/** Score a single claim-citation pair */
 export async function scoreCitationConfidence(
   claim: string,
   citation: Citation,
@@ -201,33 +268,18 @@ export async function scoreCitationConfidence(
     semanticScore = (lexicalScore + ngramScore) / 2;
   }
 
-  // Weighted combination
-  const overallScore =
-    SEMANTIC_WEIGHT * semanticScore +
-    LEXICAL_WEIGHT * lexicalScore +
-    NGRAM_WEIGHT * ngramScore +
-    ENTITY_WEIGHT * entityScore;
-
-  const confidenceLevel = getConfidenceLevel(overallScore);
+  const overallScore = computeOverallScore(semanticScore, lexicalScore, ngramScore, entityScore);
 
   return {
     cid: citation.cid,
     claim,
-    overallScore: Math.round(overallScore * 1000) / 1000,
-    semanticScore: Math.round(semanticScore * 1000) / 1000,
-    lexicalScore: Math.round(lexicalScore * 1000) / 1000,
-    ngramScore: Math.round(ngramScore * 1000) / 1000,
-    entityScore: Math.round(entityScore * 1000) / 1000,
-    confidenceLevel,
+    overallScore: round3(overallScore),
+    semanticScore: round3(semanticScore),
+    lexicalScore: round3(lexicalScore),
+    ngramScore: round3(ngramScore),
+    entityScore: round3(entityScore),
+    confidenceLevel: getConfidenceLevel(overallScore),
   };
-}
-
-/**
- * Batch score all citations in an answer
- */
-export interface ClaimCitationPair {
-  claim: string;
-  cid: string;
 }
 
 export async function batchScoreCitations(
@@ -298,104 +350,77 @@ export function extractClaimCitationPairs(answer: string): ClaimCitationPair[] {
   return pairs;
 }
 
-/**
- * Filter citations by confidence threshold
- * Returns only citations that meet minimum confidence requirements
- */
-export function filterByConfidence(
-  scores: CitationConfidenceScore[],
-  minConfidence: number = MIN_ACCEPTABLE_CONFIDENCE
-): {
+/** Filter result with accepted and rejected citations */
+interface FilterResult {
   accepted: CitationConfidenceScore[];
   rejected: CitationConfidenceScore[];
-} {
+}
+
+/** Core filtering logic shared by all filter functions */
+function partitionByThreshold(
+  scores: CitationConfidenceScore[],
+  threshold: number
+): FilterResult {
   const accepted: CitationConfidenceScore[] = [];
   const rejected: CitationConfidenceScore[] = [];
 
   for (const score of scores) {
-    if (score.overallScore >= minConfidence) {
+    if (score.overallScore >= threshold) {
       accepted.push(score);
     } else {
       rejected.push(score);
     }
-  }
-
-  if (rejected.length > 0) {
-    logWarn('Citations rejected due to low confidence', {
-      rejectedCount: rejected.length,
-      rejectedCids: rejected.map(r => r.cid),
-      lowestScore: Math.min(...rejected.map(r => r.overallScore)),
-    });
   }
 
   return { accepted, rejected };
 }
 
-// Intent-specific threshold adjustments
-const INTENT_THRESHOLD_ADJUSTMENTS: Record<string, number> = {
-  factual: 0.05,      // Stricter for factual queries
-  procedural: 0.0,
-  conceptual: -0.05,  // Slightly more lenient for conceptual
-  comparative: 0.0,
-  exploratory: -0.05,
-  clarification: 0.0,
-  summarize: -0.03,
-  list: 0.0,
-  decision: 0.03,
-  action_item: 0.02,
-  question: 0.0,
-  search: 0.0,
-};
+/** Filter citations by confidence threshold */
+export function filterByConfidence(
+  scores: CitationConfidenceScore[],
+  minConfidence: number = MIN_ACCEPTABLE_CONFIDENCE
+): FilterResult {
+  const result = partitionByThreshold(scores, minConfidence);
 
-/**
- * Get adjusted threshold based on query intent
- */
-export function getAdjustedThreshold(
-  baseThreshold: number,
-  intent: string
-): number {
+  if (result.rejected.length > 0) {
+    logWarn('Citations rejected due to low confidence', {
+      rejectedCount: result.rejected.length,
+      rejectedCids: result.rejected.map(r => r.cid),
+      lowestScore: Math.min(...result.rejected.map(r => r.overallScore)),
+    });
+  }
+
+  return result;
+}
+
+/** Get adjusted threshold based on query intent */
+export function getAdjustedThreshold(baseThreshold: number, intent: string): number {
   const adjustment = INTENT_THRESHOLD_ADJUSTMENTS[intent] || 0;
   return Math.max(0.2, Math.min(0.9, baseThreshold + adjustment));
 }
 
-/**
- * Filter citations with intent-aware thresholds
- */
+/** Filter citations with intent-aware thresholds */
 export function filterByConfidenceWithIntent(
   scores: CitationConfidenceScore[],
   intent: string,
   baseMinConfidence: number = MIN_ACCEPTABLE_CONFIDENCE
-): {
-  accepted: CitationConfidenceScore[];
-  rejected: CitationConfidenceScore[];
-  adjustedThreshold: number;
-} {
+): FilterResult & { adjustedThreshold: number } {
   const adjustedThreshold = getAdjustedThreshold(baseMinConfidence, intent);
+  const result = partitionByThreshold(scores, adjustedThreshold);
 
-  const accepted: CitationConfidenceScore[] = [];
-  const rejected: CitationConfidenceScore[] = [];
-
-  for (const score of scores) {
-    if (score.overallScore >= adjustedThreshold) {
-      accepted.push(score);
-    } else {
-      rejected.push(score);
-    }
-  }
-
-  if (rejected.length > 0) {
+  if (result.rejected.length > 0) {
     logWarn('Citations rejected due to low confidence (intent-adjusted)', {
       intent,
       adjustedThreshold,
-      rejectedCount: rejected.length,
-      rejectedCids: rejected.map(r => r.cid),
+      rejectedCount: result.rejected.length,
+      rejectedCids: result.rejected.map(r => r.cid),
     });
   }
 
-  return { accepted, rejected, adjustedThreshold };
+  return { ...result, adjustedThreshold };
 }
 
-// Export configuration for observability
+/** Export configuration for observability */
 export function getCitationConfidenceConfig() {
   return {
     weights: {
@@ -413,42 +438,50 @@ export function getCitationConfidenceConfig() {
   };
 }
 
-/**
- * Aggregate confidence score for entire response
- */
-export interface ResponseConfidenceAggregate {
-  overallScore: number;
-  scoreDistribution: {
-    high: number;
-    medium: number;
-    low: number;
-    insufficient: number;
+/** Create empty aggregate result */
+function createEmptyAggregate(): ResponseConfidenceAggregate {
+  return {
+    overallScore: 0,
+    scoreDistribution: { high: 0, medium: 0, low: 0, insufficient: 0 },
+    weakestCitations: [],
+    strongestCitations: [],
+    confidenceLevel: 'insufficient',
+    recommendation: 'No citations to evaluate',
   };
-  weakestCitations: Array<{ cid: string; score: number }>;
-  strongestCitations: Array<{ cid: string; score: number }>;
-  confidenceLevel: 'high' | 'medium' | 'low' | 'insufficient';
-  recommendation: string;
 }
 
-/**
- * Aggregate confidence scores across all citations in a response
- */
+/** Generate recommendation based on score distribution */
+function generateRecommendation(
+  distribution: Record<ConfidenceLevelType, number>,
+  totalCount: number
+): string {
+  if (distribution.insufficient > 0) {
+    return `${distribution.insufficient} citation(s) have insufficient support - consider removing or finding better sources`;
+  }
+  if (distribution.low > totalCount / 2) {
+    return 'Majority of citations have low confidence - consider verifying claims';
+  }
+  if (distribution.high > totalCount / 2) {
+    return 'Response is well-grounded with high-confidence citations';
+  }
+  return 'Response has moderate citation confidence';
+}
+
+/** Aggregate confidence scores across all citations in a response */
 export function aggregateConfidenceScores(
   scores: CitationConfidenceScore[]
 ): ResponseConfidenceAggregate {
   if (scores.length === 0) {
-    return {
-      overallScore: 0,
-      scoreDistribution: { high: 0, medium: 0, low: 0, insufficient: 0 },
-      weakestCitations: [],
-      strongestCitations: [],
-      confidenceLevel: 'insufficient',
-      recommendation: 'No citations to evaluate',
-    };
+    return createEmptyAggregate();
   }
 
   // Calculate distribution
-  const distribution = { high: 0, medium: 0, low: 0, insufficient: 0 };
+  const distribution: Record<ConfidenceLevelType, number> = {
+    high: 0,
+    medium: 0,
+    low: 0,
+    insufficient: 0,
+  };
   for (const score of scores) {
     distribution[score.confidenceLevel]++;
   }
@@ -460,42 +493,34 @@ export function aggregateConfidenceScores(
   const overallAvg = sortedScores.reduce((a, b) => a + b, 0) / sortedScores.length;
 
   // Weight towards lower scores (pessimistic aggregation)
-  const overallScore = lowestAvg * 0.4 + overallAvg * 0.6;
+  const overallScore = lowestAvg * LOWEST_THIRD_WEIGHT + overallAvg * OVERALL_AVG_WEIGHT;
 
   // Get weakest and strongest
   const sorted = [...scores].sort((a, b) => a.overallScore - b.overallScore);
-  const weakestCitations = sorted.slice(0, 3).map(s => ({ cid: s.cid, score: s.overallScore }));
-  const strongestCitations = sorted.slice(-3).reverse().map(s => ({ cid: s.cid, score: s.overallScore }));
-
-  // Determine overall level
-  const confidenceLevel = getConfidenceLevel(overallScore);
-
-  // Generate recommendation
-  let recommendation: string;
-  if (distribution.insufficient > 0) {
-    recommendation = `${distribution.insufficient} citation(s) have insufficient support - consider removing or finding better sources`;
-  } else if (distribution.low > scores.length / 2) {
-    recommendation = 'Majority of citations have low confidence - consider verifying claims';
-  } else if (distribution.high > scores.length / 2) {
-    recommendation = 'Response is well-grounded with high-confidence citations';
-  } else {
-    recommendation = 'Response has moderate citation confidence';
-  }
+  const weakestCitations = sorted.slice(0, TOP_CITATIONS_COUNT).map(s => ({ cid: s.cid, score: s.overallScore }));
+  const strongestCitations = sorted.slice(-TOP_CITATIONS_COUNT).reverse().map(s => ({ cid: s.cid, score: s.overallScore }));
 
   return {
-    overallScore: Math.round(overallScore * 1000) / 1000,
+    overallScore: round3(overallScore),
     scoreDistribution: distribution,
     weakestCitations,
     strongestCitations,
-    confidenceLevel,
-    recommendation,
+    confidenceLevel: getConfidenceLevel(overallScore),
+    recommendation: generateRecommendation(distribution, scores.length),
   };
 }
 
-/**
- * Calculate factual alignment score
- * Checks if numerical values, dates, and specific facts match
- */
+// =============================================================================
+// Factual Alignment
+// =============================================================================
+
+// Factual alignment scoring constants
+const UNMATCHED_NUMBER_PENALTY = 0.15;
+const UNMATCHED_QUOTE_PENALTY = 0.20;
+const NEUTRAL_FACTUAL_SCORE = 0.7;
+const FACTUAL_ALIGNMENT_WEIGHT = 0.15;
+
+/** Calculate factual alignment score - checks if numbers and quotes match */
 export function calculateFactualAlignment(claim: string, source: string): number {
   let alignmentScore = 1.0;
   let factCount = 0;
@@ -507,7 +532,7 @@ export function calculateFactualAlignment(claim: string, source: string): number
   for (const num of claimNumbers) {
     factCount++;
     if (!sourceNumbers.has(num)) {
-      alignmentScore -= 0.15; // Penalty for unmatched number
+      alignmentScore -= UNMATCHED_NUMBER_PENALTY;
     }
   }
 
@@ -516,19 +541,17 @@ export function calculateFactualAlignment(claim: string, source: string): number
   for (const quote of claimQuotes) {
     factCount++;
     if (!source.includes(quote.replace(/"/g, ''))) {
-      alignmentScore -= 0.2; // Penalty for unmatched quote
+      alignmentScore -= UNMATCHED_QUOTE_PENALTY;
     }
   }
 
   // If no specific facts, return neutral
-  if (factCount === 0) return 0.7;
+  if (factCount === 0) return NEUTRAL_FACTUAL_SCORE;
 
   return Math.max(0, Math.min(1, alignmentScore));
 }
 
-/**
- * Enhanced score with factual alignment
- */
+/** Enhanced score with factual alignment */
 export async function scoreWithFactualAlignment(
   claim: string,
   citation: Citation,
@@ -540,17 +563,15 @@ export async function scoreWithFactualAlignment(
   const factualScore = calculateFactualAlignment(claim, sourceText);
 
   // Adjust overall score based on factual alignment
-  const adjustedOverall = baseScore.overallScore * 0.85 + factualScore * 0.15;
-  const adjustedLevel = getConfidenceLevel(adjustedOverall);
+  const adjustedOverall = baseScore.overallScore * (1 - FACTUAL_ALIGNMENT_WEIGHT) + factualScore * FACTUAL_ALIGNMENT_WEIGHT;
 
   return {
     ...baseScore,
-    overallScore: Math.round(adjustedOverall * 1000) / 1000,
-    confidenceLevel: adjustedLevel,
-    factualScore: Math.round(factualScore * 1000) / 1000,
+    overallScore: round3(adjustedOverall),
+    confidenceLevel: getConfidenceLevel(adjustedOverall),
+    factualScore: round3(factualScore),
     explanation: factualScore < 0.5
       ? 'Some specific facts in claim may not match source'
       : baseScore.explanation,
   };
 }
-

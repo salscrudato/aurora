@@ -38,16 +38,15 @@ import {
 import { RETRIEVAL_TOP_K, MAX_CHUNKS_IN_CONTEXT, CHAT_MODEL } from "./config";
 import { logInfo, logError, logWarn, generateRequestId, withRequestContext, isValidTenantId } from "./utils";
 import { ChatRequest, NoteDoc } from "./types";
-import { rateLimitMiddleware, getRateLimitStats } from "./rateLimit";
 import { processNoteChunks } from "./chunking";
 import { getDb } from "./firestore";
 import { internalAuthMiddleware, isInternalAuthConfigured } from "./internalAuth";
 import { getVertexConfigStatus, isVertexConfigured } from "./vectorIndex";
 import { isGenAIAvailable } from "./genaiClient";
-import { userAuthMiddleware, isUserAuthEnabled, perUserRateLimiter, audioUpload, getNormalizedMimeType, handleMulterError } from "./middleware";
+import { userAuthMiddleware, isUserAuthEnabled, perUserRateLimiter, ipRateLimiter, getRateLimiterStats, audioUpload, getNormalizedMimeType, handleMulterError } from "./middleware";
 import { validateBody, validateQuery, validateParams } from "./middleware";
 import { transcribeAudio, TranscriptionError } from "./transcription";
-import { errorHandler, asyncHandler, Errors, ApiError } from "./errors";
+import { errorHandler, asyncHandler, Errors } from "./errors";
 import {
   CreateNoteSchema,
   UpdateNoteSchema,
@@ -121,7 +120,7 @@ app.use((req, res, next) => {
 });
 
 // Global rate limiting (IP-based)
-app.use(rateLimitMiddleware);
+app.use(ipRateLimiter);
 
 // ============================================
 // Health & Readiness Endpoints (no auth required)
@@ -195,7 +194,7 @@ app.get("/ready", asyncHandler(async (_req, res) => {
     version: '2.0.0',
     checks,
     totalLatencyMs,
-    rateLimitStats: getRateLimitStats(),
+    rateLimitStats: getRateLimiterStats(),
   };
 
   res.status(allHealthy ? 200 : 503).json(response);
@@ -221,7 +220,7 @@ app.get("/metrics", (_req, res) => {
       rssMB: Math.round(memUsage.rss / 1024 / 1024 * 100) / 100,
       externalMB: Math.round(memUsage.external / 1024 / 1024 * 100) / 100,
     },
-    rateLimiting: getRateLimitStats(),
+    rateLimiting: getRateLimiterStats(),
     nodeVersion: process.version,
     platform: process.platform,
   });

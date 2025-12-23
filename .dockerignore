@@ -1,0 +1,62 @@
+# =============================================================================
+# Docker Build Context Exclusions
+# Reduces build context size and prevents sensitive files from being included
+# =============================================================================
+
+# Dependencies (will be installed fresh in container)
+node_modules/
+npm-debug.log*
+
+# Build outputs (will be built in container)
+dist/
+*.tsbuildinfo
+
+# Development files
+.git/
+.gitignore
+.vscode/
+.idea/
+*.md
+!README.md
+
+# Test files
+*.test.ts
+*.spec.ts
+__tests__/
+coverage/
+.nyc_output/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+service-account*.json
+firebase-adminsdk*.json
+
+# Docker files (not needed in context for most operations)
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# IDE and OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+
+# Misc
+scripts/
+*.tgz
+.gcloudignore

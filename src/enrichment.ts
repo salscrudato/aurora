@@ -1,27 +1,29 @@
 /**
  * AuroraNotes API - Note Enrichment Service
  *
- * Extracts structured metadata from notes using LLM:
- * - Title derivation (if not provided)
- * - Summary generation
- * - Note type classification
- * - Action item extraction
- * - Named entity extraction
+ * Extracts structured metadata from notes using LLM.
  */
 
 import { getGenAIClient, isGenAIAvailable, acquireRequestSlot } from './genaiClient';
 import { logInfo, logError, logWarn } from './utils';
 import { NoteType, ActionItem, Entity } from './types';
 
-// Configuration
-const ENRICHMENT_MODEL = process.env.ENRICHMENT_MODEL || 'gemini-2.0-flash';
-const ENRICHMENT_TIMEOUT_MS = parseInt(process.env.ENRICHMENT_TIMEOUT_MS || '15000');
-const ENRICHMENT_MAX_INPUT_CHARS = 8000; // Limit input to avoid token limits
+// =============================================================================
+// Constants
+// =============================================================================
 
-/**
- * Enrichment result from LLM
- */
-export interface EnrichmentResult {
+const MODEL = process.env.ENRICHMENT_MODEL || 'gemini-2.0-flash';
+const TIMEOUT_MS = parseInt(process.env.ENRICHMENT_TIMEOUT_MS || '15000');
+const MAX_INPUT_CHARS = 8000;
+
+const VALID_NOTE_TYPES: NoteType[] = ['meeting', 'idea', 'task', 'reference', 'journal', 'other'];
+const VALID_ENTITY_TYPES = ['person', 'organization', 'location', 'date', 'product', 'other'];
+
+// =============================================================================
+// Types
+// =============================================================================
+
+interface EnrichmentResult {
   title?: string;
   summary?: string;
   noteType?: NoteType;
@@ -29,105 +31,43 @@ export interface EnrichmentResult {
   entities?: Entity[];
 }
 
-/**
- * Enrich a note with AI-generated metadata
- */
-export async function enrichNote(
-  text: string,
-  existingTitle?: string
-): Promise<EnrichmentResult> {
-  if (!isGenAIAvailable()) {
-    logWarn('GenAI not available for enrichment');
-    return {};
-  }
+// =============================================================================
+// Prompt Building
+// =============================================================================
 
-  // Truncate text if too long
-  const truncatedText = text.slice(0, ENRICHMENT_MAX_INPUT_CHARS);
-  const wasTruncated = text.length > ENRICHMENT_MAX_INPUT_CHARS;
-
-  const prompt = buildEnrichmentPrompt(truncatedText, existingTitle, wasTruncated);
-
-  const releaseSlot = await acquireRequestSlot();
-  try {
-    const client = getGenAIClient();
-
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error('Enrichment timeout')), ENRICHMENT_TIMEOUT_MS);
-    });
-
-    const response = await Promise.race([
-      client.models.generateContent({
-        model: ENRICHMENT_MODEL,
-        contents: prompt,
-        config: { temperature: 0.3, maxOutputTokens: 1000 },
-      }),
-      timeoutPromise,
-    ]);
-
-    const responseText = response.text || '';
-    const result = parseEnrichmentResponse(responseText);
-
-    logInfo('Note enriched successfully', {
-      hasTitle: !!result.title,
-      hasSummary: !!result.summary,
-      noteType: result.noteType,
-      actionItemCount: result.actionItems?.length || 0,
-      entityCount: result.entities?.length || 0,
-    });
-
-    return result;
-  } catch (err) {
-    logError('Note enrichment failed', err);
-    return {};
-  } finally {
-    releaseSlot();
-  }
-}
-
-/**
- * Build the enrichment prompt
- */
-function buildEnrichmentPrompt(
-  text: string,
-  existingTitle?: string,
-  wasTruncated?: boolean
-): string {
-  const titleInstruction = existingTitle
-    ? 'The note already has a title, so skip title generation.'
-    : 'Generate a concise title (max 100 chars) that captures the main topic.';
+function buildPrompt(text: string, hasTitle: boolean, wasTruncated: boolean): string {
+  const titleLine = hasTitle ? '' : '  "title": "Concise title (max 100 chars)",\n';
+  const truncNote = wasTruncated ? ' (note was truncated)' : '';
 
   return `Analyze this note and extract structured metadata.
+${hasTitle ? 'Skip title generation.' : 'Generate a concise title (max 100 chars).'}
 
-${titleInstruction}
+Extract:
+- summary: 1-2 sentence summary${truncNote}
+- noteType: meeting|idea|task|reference|journal|other
+- actionItems: todos with text, completed status, dueDate (YYYY-MM-DD or null)
+- entities: people, organizations, locations, dates, products
 
-Generate:
-1. ${existingTitle ? 'Skip title' : 'title: A concise title (max 100 chars)'}
-2. summary: A 1-2 sentence summary of the key points${wasTruncated ? ' (note was truncated)' : ''}
-3. noteType: Classify as one of: meeting, idea, task, reference, journal, other
-4. actionItems: Extract any action items/todos (text, completed status, due date if mentioned)
-5. entities: Extract named entities (people, organizations, locations, dates, products)
-
-Note content:
+Note:
 ---
 ${text}
 ---
 
 Respond with valid JSON only:
 {
-  ${existingTitle ? '' : '"title": "...",'}
-  "summary": "...",
-  "noteType": "meeting|idea|task|reference|journal|other",
-  "actionItems": [{"text": "...", "completed": false, "dueDate": "YYYY-MM-DD or null"}],
+${titleLine}  "summary": "...",
+  "noteType": "...",
+  "actionItems": [{"text": "...", "completed": false, "dueDate": null}],
   "entities": [{"text": "...", "type": "person|organization|location|date|product|other"}]
 }`;
 }
 
-/**
- * Parse the LLM response into structured data
- */
-function parseEnrichmentResponse(responseText: string): EnrichmentResult {
+// =============================================================================
+// Response Parsing
+// =============================================================================
+
+function parseResponse(responseText: string): EnrichmentResult {
   try {
-    // Extract JSON from response (may have markdown code blocks)
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
       logWarn('No JSON found in enrichment response');
@@ -137,23 +77,16 @@ function parseEnrichmentResponse(responseText: string): EnrichmentResult {
     const parsed = JSON.parse(jsonMatch[0]);
     const result: EnrichmentResult = {};
 
-    // Validate and extract title
-    if (parsed.title && typeof parsed.title === 'string') {
+    if (typeof parsed.title === 'string') {
       result.title = parsed.title.slice(0, 200);
     }
-
-    // Validate and extract summary
-    if (parsed.summary && typeof parsed.summary === 'string') {
+    if (typeof parsed.summary === 'string') {
       result.summary = parsed.summary.slice(0, 500);
     }
-
-    // Validate note type
-    const validNoteTypes: NoteType[] = ['meeting', 'idea', 'task', 'reference', 'journal', 'other'];
-    if (parsed.noteType && validNoteTypes.includes(parsed.noteType)) {
+    if (VALID_NOTE_TYPES.includes(parsed.noteType)) {
       result.noteType = parsed.noteType;
     }
 
-    // Validate action items
     if (Array.isArray(parsed.actionItems)) {
       result.actionItems = parsed.actionItems
         .filter((item: any) => item && typeof item.text === 'string')
@@ -165,16 +98,11 @@ function parseEnrichmentResponse(responseText: string): EnrichmentResult {
         }));
     }
 
-    // Validate entities
     if (Array.isArray(parsed.entities)) {
-      const validEntityTypes = ['person', 'organization', 'location', 'date', 'product', 'other'];
       result.entities = parsed.entities
-        .filter((e: any) => e && typeof e.text === 'string' && validEntityTypes.includes(e.type))
+        .filter((e: any) => e && typeof e.text === 'string' && VALID_ENTITY_TYPES.includes(e.type))
         .slice(0, 50)
-        .map((e: any) => ({
-          text: e.text.slice(0, 200),
-          type: e.type,
-        }));
+        .map((e: any) => ({ text: e.text.slice(0, 200), type: e.type }));
     }
 
     return result;
@@ -184,3 +112,49 @@ function parseEnrichmentResponse(responseText: string): EnrichmentResult {
   }
 }
 
+// =============================================================================
+// Public API
+// =============================================================================
+
+export async function enrichNote(text: string, existingTitle?: string): Promise<EnrichmentResult> {
+  if (!isGenAIAvailable()) {
+    logWarn('GenAI not available for enrichment');
+    return {};
+  }
+
+  const truncatedText = text.slice(0, MAX_INPUT_CHARS);
+  const prompt = buildPrompt(truncatedText, !!existingTitle, text.length > MAX_INPUT_CHARS);
+
+  const releaseSlot = await acquireRequestSlot();
+  try {
+    const client = getGenAIClient();
+
+    const response = await Promise.race([
+      client.models.generateContent({
+        model: MODEL,
+        contents: prompt,
+        config: { temperature: 0.3, maxOutputTokens: 1000 },
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Enrichment timeout')), TIMEOUT_MS)
+      ),
+    ]);
+
+    const result = parseResponse(response.text || '');
+
+    logInfo('Note enriched', {
+      hasTitle: !!result.title,
+      hasSummary: !!result.summary,
+      noteType: result.noteType,
+      actionItems: result.actionItems?.length || 0,
+      entities: result.entities?.length || 0,
+    });
+
+    return result;
+  } catch (err) {
+    logError('Note enrichment failed', err);
+    return {};
+  } finally {
+    releaseSlot();
+  }
+}

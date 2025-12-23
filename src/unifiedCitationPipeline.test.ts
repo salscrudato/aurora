@@ -1,129 +1,54 @@
-/**
- * Unified Citation Pipeline Tests
- *
- * Tests for the citation validation pipeline including:
- * - Citation extraction and validation
- * - Invalid citation removal
- * - Contract compliance checking
- * - Quick verification functions
- *
- * Run with: npx tsx --test src/unifiedCitationPipeline.test.ts
- */
+/** Unified Citation Pipeline Tests - Run: npx tsx --test src/unifiedCitationPipeline.test.ts */
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import {
-  extractCitationIds,
-  getUniqueCitationIds,
-  quickVerifyCitation,
-  analyzeContradiction,
-  getPipelineConfig,
-} from './unifiedCitationPipeline';
+import { extractCitationIds, getUniqueCitationIds, quickVerifyCitation, analyzeContradiction, getPipelineConfig } from './unifiedCitationPipeline';
 
 describe('extractCitationIds', () => {
-  it('extracts citation IDs from answer text', () => {
-    const answer = 'The project uses React [N1] and TypeScript [N2].';
-    const cids = extractCitationIds(answer);
-    assert.deepStrictEqual(cids, ['N1', 'N2']);
-  });
-
-  it('handles multiple citations in sequence', () => {
-    const answer = 'This is supported by multiple sources [N1][N2][N3].';
-    const cids = extractCitationIds(answer);
-    assert.deepStrictEqual(cids, ['N1', 'N2', 'N3']);
-  });
-
-  it('handles repeated citations', () => {
-    const answer = 'First mention [N1], second mention [N2], back to first [N1].';
-    const cids = extractCitationIds(answer);
-    assert.deepStrictEqual(cids, ['N1', 'N2', 'N1']);
-  });
-
-  it('returns empty array for no citations', () => {
-    const answer = 'This answer has no citations.';
-    const cids = extractCitationIds(answer);
-    assert.deepStrictEqual(cids, []);
-  });
-
-  it('handles multi-digit citation IDs', () => {
-    const answer = 'Source [N10] and source [N25] are relevant.';
-    const cids = extractCitationIds(answer);
-    assert.deepStrictEqual(cids, ['N10', 'N25']);
+  it('extracts citation IDs from text', () => {
+    assert.deepStrictEqual(extractCitationIds('Uses React [N1] and TypeScript [N2].'), ['N1', 'N2']);
+    assert.deepStrictEqual(extractCitationIds('Multiple sources [N1][N2][N3].'), ['N1', 'N2', 'N3']);
+    assert.deepStrictEqual(extractCitationIds('First [N1], second [N2], first [N1].'), ['N1', 'N2', 'N1']);
+    assert.deepStrictEqual(extractCitationIds('No citations here.'), []);
+    assert.deepStrictEqual(extractCitationIds('Source [N10] and [N25].'), ['N10', 'N25']);
   });
 });
 
 describe('getUniqueCitationIds', () => {
-  it('returns unique citation IDs in order of first appearance', () => {
-    const answer = 'First [N1], second [N2], first again [N1], third [N3].';
-    const uniqueCids = getUniqueCitationIds(answer);
-    assert.deepStrictEqual(uniqueCids, ['N1', 'N2', 'N3']);
-  });
-
-  it('preserves order of first appearance', () => {
-    const answer = 'Start with [N3], then [N1], then [N2].';
-    const uniqueCids = getUniqueCitationIds(answer);
-    assert.deepStrictEqual(uniqueCids, ['N3', 'N1', 'N2']);
-  });
-
-  it('returns empty array for no citations', () => {
-    const answer = 'No citations here.';
-    const uniqueCids = getUniqueCitationIds(answer);
-    assert.deepStrictEqual(uniqueCids, []);
+  it('returns unique IDs in order of first appearance', () => {
+    assert.deepStrictEqual(getUniqueCitationIds('First [N1], second [N2], first [N1], third [N3].'), ['N1', 'N2', 'N3']);
+    assert.deepStrictEqual(getUniqueCitationIds('Start [N3], then [N1], then [N2].'), ['N3', 'N1', 'N2']);
+    assert.deepStrictEqual(getUniqueCitationIds('No citations.'), []);
   });
 });
 
 describe('quickVerifyCitation', () => {
-  it('returns high score for exact match', () => {
-    const claim = 'The project uses React';
-    const source = 'The project uses React for the frontend.';
-    const result = quickVerifyCitation(claim, source);
-    assert.ok(result.isValid, 'Should be valid for exact match');
-    assert.ok(result.confidence > 0.5, 'Should have high confidence');
-  });
+  it('returns appropriate scores for match quality', () => {
+    const exact = quickVerifyCitation('The project uses React', 'The project uses React for the frontend.');
+    assert.ok(exact.isValid && exact.confidence > 0.5);
 
-  it('returns high score for semantic overlap', () => {
-    const claim = 'React is used for the frontend';
-    const source = 'The frontend is built with React and TypeScript.';
-    const result = quickVerifyCitation(claim, source);
-    assert.ok(result.confidence > 0.3, 'Should have reasonable confidence for overlap');
-  });
+    const overlap = quickVerifyCitation('React is used for the frontend', 'The frontend is built with React and TypeScript.');
+    assert.ok(overlap.confidence > 0.3);
 
-  it('returns low score for unrelated content', () => {
-    const claim = 'The database uses PostgreSQL';
-    const source = 'The frontend uses React and TypeScript.';
-    const result = quickVerifyCitation(claim, source);
-    assert.ok(result.confidence < 0.5, 'Should have low confidence for unrelated content');
+    const unrelated = quickVerifyCitation('The database uses PostgreSQL', 'The frontend uses React and TypeScript.');
+    assert.ok(unrelated.confidence < 0.5);
   });
 });
 
 describe('analyzeContradiction', () => {
-  it('detects negation contradictions', () => {
-    const claim = 'The feature is enabled';
-    const source = 'The feature is not enabled';
-    const result = analyzeContradiction(claim, source);
-    assert.ok(result.hasContradiction, 'Should detect negation contradiction');
-  });
-
-  it('returns no contradiction for consistent statements', () => {
-    const claim = 'The project uses React';
-    const source = 'The project uses React for the frontend.';
-    const result = analyzeContradiction(claim, source);
-    assert.ok(!result.hasContradiction, 'Should not detect contradiction');
+  it('detects contradictions correctly', () => {
+    assert.ok(analyzeContradiction('The feature is enabled', 'The feature is not enabled').hasContradiction);
+    assert.ok(!analyzeContradiction('The project uses React', 'The project uses React for the frontend.').hasContradiction);
   });
 });
 
 describe('getPipelineConfig', () => {
-  it('returns pipeline configuration object', () => {
+  it('returns valid config object', () => {
     const config = getPipelineConfig();
-    assert.ok(typeof config === 'object', 'Should return an object');
-    assert.ok('minLexicalOverlap' in config, 'Should have minLexicalOverlap');
-    assert.ok('minConfidenceThreshold' in config, 'Should have minConfidenceThreshold');
+    assert.ok(typeof config === 'object' && 'minLexicalOverlap' in config && 'minConfidenceThreshold' in config);
   });
 
-  it('returns a copy of config (not reference)', () => {
-    const config1 = getPipelineConfig();
-    const config2 = getPipelineConfig();
-    assert.notStrictEqual(config1, config2, 'Should return different object references');
+  it('returns copies not references', () => {
+    assert.notStrictEqual(getPipelineConfig(), getPipelineConfig());
   });
 });
-

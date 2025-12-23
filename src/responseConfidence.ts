@@ -1,337 +1,126 @@
 /**
- * AuroraNotes API - Response Confidence Calibration
- *
- * Implements calibrated confidence scores based on:
- * - Citation density (how well-cited is the response)
- * - Source relevance (how relevant are the cited sources)
- * - Answer coherence (structural and logical consistency)
- * - Claim support (how well claims are supported)
- *
- * Provides an overall confidence score that reflects
- * how trustworthy the response is.
+ * Response Confidence Calibration - Calculates trustworthiness scores for responses
  */
 
 import { Citation, ScoredChunk, QueryIntent } from './types';
-import { logInfo, logWarn } from './utils';
+import { logWarn } from './utils';
 
-/**
- * Confidence score breakdown
- */
 export interface ConfidenceBreakdown {
-  citationDensity: number;      // 0-1: ratio of cited sentences
-  sourceRelevance: number;      // 0-1: average relevance of cited sources
-  answerCoherence: number;      // 0-1: structural consistency
-  claimSupport: number;         // 0-1: how well claims are supported
-  overallConfidence: number;    // 0-1: weighted combination
+  citationDensity: number;
+  sourceRelevance: number;
+  answerCoherence: number;
+  claimSupport: number;
+  overallConfidence: number;
   confidenceLevel: 'very_high' | 'high' | 'medium' | 'low' | 'very_low';
-  calibrationFactors: string[]; // Factors affecting confidence
+  calibrationFactors: string[];
 }
 
-/**
- * Weights for confidence components
- */
-const WEIGHTS = {
-  citationDensity: 0.25,
-  sourceRelevance: 0.30,
-  answerCoherence: 0.20,
-  claimSupport: 0.25,
-};
+const WEIGHTS = { citationDensity: 0.25, sourceRelevance: 0.30, answerCoherence: 0.20, claimSupport: 0.25 };
+const THRESHOLDS = { veryHigh: 0.85, high: 0.70, medium: 0.50, low: 0.30 };
 
-/**
- * Thresholds for confidence levels
- */
-const THRESHOLDS = {
-  veryHigh: 0.85,
-  high: 0.70,
-  medium: 0.50,
-  low: 0.30,
-};
+const clamp = (n: number) => Math.max(0, Math.min(1, n));
+const round3 = (n: number) => Math.round(n * 1000) / 1000;
+const splitSentences = (text: string, minLen = 10) => text.split(/(?<=[.!?])\s+/).filter(s => s.trim().length > minLen);
 
-/**
- * Calculate citation density score
- * Measures what proportion of sentences have citations
- */
-function calculateCitationDensity(answer: string): {
-  score: number;
-  citedSentences: number;
-  totalSentences: number;
-} {
-  const sentences = answer.split(/(?<=[.!?])\s+/).filter(s => s.trim().length > 10);
-  const citedSentences = sentences.filter(s => /\[N\d+\]/.test(s)).length;
+function calcCitationDensity(answer: string) {
+  const sentences = splitSentences(answer);
+  const cited = sentences.filter(s => /\[N\d+\]/.test(s)).length;
+  if (!sentences.length) return { score: 0, cited: 0, total: 0 };
 
-  if (sentences.length === 0) {
-    return { score: 0, citedSentences: 0, totalSentences: 0 };
-  }
-
-  // Optimal density is around 60-80% (not every sentence needs citation)
-  const rawDensity = citedSentences / sentences.length;
-
-  // Score peaks at 70% density, penalize both under and over-citation
-  let score: number;
-  if (rawDensity <= 0.7) {
-    score = rawDensity / 0.7; // Linear increase to 70%
-  } else {
-    // Slight penalty for over-citation (can indicate padding)
-    score = 1 - (rawDensity - 0.7) * 0.5;
-  }
-
-  return {
-    score: Math.max(0, Math.min(1, score)),
-    citedSentences,
-    totalSentences: sentences.length,
-  };
+  const density = cited / sentences.length;
+  // Score peaks at 70% density, slight penalty for over-citation
+  const score = density <= 0.7 ? density / 0.7 : 1 - (density - 0.7) * 0.5;
+  return { score: clamp(score), cited, total: sentences.length };
 }
 
-/**
- * Calculate source relevance score
- * Based on the retrieval scores of cited sources
- */
-function calculateSourceRelevance(
-  answer: string,
-  citations: Citation[],
-  chunks: ScoredChunk[]
-): {
-  score: number;
-  averageScore: number;
-  citedCount: number;
-} {
-  // Find which citations are actually used in the answer
-  const usedCids = new Set<string>();
-  const citationMatches = answer.matchAll(/\[N(\d+)\]/g);
-  for (const match of citationMatches) {
-    usedCids.add(`N${match[1]}`);
-  }
+function calcSourceRelevance(answer: string, citations: Citation[], chunks: ScoredChunk[]) {
+  const usedCids = new Set([...answer.matchAll(/\[N(\d+)\]/g)].map(m => `N${m[1]}`));
+  if (!usedCids.size) return { score: 0, avg: 0, count: 0 };
 
-  if (usedCids.size === 0) {
-    return { score: 0, averageScore: 0, citedCount: 0 };
-  }
-
-  // Get scores for used citations
   const citationMap = new Map(citations.map(c => [c.cid, c]));
   const chunkMap = new Map(chunks.map(c => [c.chunkId, c]));
 
-  let totalScore = 0;
-  let count = 0;
-
+  let total = 0, count = 0;
   for (const cid of usedCids) {
-    const citation = citationMap.get(cid);
-    if (citation) {
-      const chunk = chunkMap.get(citation.chunkId);
-      if (chunk) {
-        totalScore += chunk.score;
-        count++;
-      }
-    }
+    const chunk = chunkMap.get(citationMap.get(cid)?.chunkId || '');
+    if (chunk) { total += chunk.score; count++; }
   }
 
-  const averageScore = count > 0 ? totalScore / count : 0;
-
-  // Normalize score (assuming scores are typically 0.5-1.0 range)
-  const normalizedScore = Math.min(1, (averageScore - 0.3) / 0.7);
-
-  return {
-    score: Math.max(0, normalizedScore),
-    averageScore,
-    citedCount: count,
-  };
+  const avg = count ? total / count : 0;
+  return { score: clamp((avg - 0.3) / 0.7), avg, count };
 }
 
-/**
- * Calculate answer coherence score
- * Measures structural and logical consistency
- */
-function calculateAnswerCoherence(answer: string, intent: QueryIntent): {
-  score: number;
-  issues: string[];
-} {
+const COHERENCE_CHECKS: [RegExp | ((a: string, i: QueryIntent) => boolean), string, number][] = [
+  [a => !a.trim().match(/[.!?]$/), 'Answer ends abruptly', 0.15],
+  [/^\s*\[N\d+\]\s*$/m, 'Orphaned citations', 0.2],
+  [/(\[N\d+\]\s*){4,}/, 'Clustered citations', 0.1],
+  [a => a.length < 50, 'Very short answer', 0.2],
+  [(a, i) => (i === 'list' || i === 'action_item') && !/[-*•]\s|^\s*\d+[.)]\s/m.test(a), 'Missing list format', 0.1],
+];
+
+function calcCoherence(answer: string, intent: QueryIntent) {
   const issues: string[] = [];
   let score = 1.0;
-
-  // Check for abrupt endings
-  if (!answer.trim().match(/[.!?]$/)) {
-    issues.push('Answer ends abruptly');
-    score -= 0.15;
+  for (const [check, msg, penalty] of COHERENCE_CHECKS) {
+    const fail = typeof check === 'function' ? check(answer, intent) : check.test(answer);
+    if (fail) { issues.push(msg); score -= penalty; }
   }
-
-  // Check for orphaned citations
-  if (/^\s*\[N\d+\]\s*$/m.test(answer)) {
-    issues.push('Contains orphaned citations');
-    score -= 0.2;
-  }
-
-  // Check for citation clusters
-  if (/(\[N\d+\]\s*){4,}/.test(answer)) {
-    issues.push('Citations are clustered');
-    score -= 0.1;
-  }
-
-  // Check for very short answers (might be incomplete)
-  if (answer.length < 50) {
-    issues.push('Answer is very short');
-    score -= 0.2;
-  }
-
-  // Intent-specific coherence checks
-  if ((intent === 'list' || intent === 'action_item') && !/[-*•]\s|^\s*\d+[.)]\s/m.test(answer)) {
-    issues.push('List answer lacks list formatting');
-    score -= 0.1;
-  }
-
-  return {
-    score: Math.max(0, score),
-    issues,
-  };
+  return { score: Math.max(0, score), issues };
 }
 
-/**
- * Calculate claim support score
- * Estimates how well claims are supported by their citations
- */
-function calculateClaimSupport(
-  answer: string,
-  citations: Citation[]
-): {
-  score: number;
-  unsupportedClaims: number;
-} {
-  // Split into sentences and check citation coverage
-  const sentences = answer.split(/(?<=[.!?])\s+/).filter(s => s.trim().length > 20);
+const FACTUAL_PATTERNS = [/\b\d+(?:\.\d+)?%?\b/, /\b(is|are|was|were|has|have)\b/, /\b(always|never|must|should)\b/, /\b(because|therefore|thus)\b/];
 
-  // Identify factual sentences (contain specific claims)
-  const factualPatterns = [
-    /\b\d+(?:\.\d+)?%?\b/,           // Numbers
-    /\b(is|are|was|were|has|have)\b/, // Assertions
-    /\b(always|never|must|should)\b/, // Strong claims
-    /\b(because|therefore|thus)\b/,   // Causal claims
-  ];
-
-  let factualSentences = 0;
-  let citedFactualSentences = 0;
-
-  for (const sentence of sentences) {
-    const isFactual = factualPatterns.some(p => p.test(sentence));
-    if (isFactual) {
-      factualSentences++;
-      if (/\[N\d+\]/.test(sentence)) {
-        citedFactualSentences++;
-      }
+function calcClaimSupport(answer: string) {
+  const sentences = splitSentences(answer, 20);
+  let factual = 0, cited = 0;
+  for (const s of sentences) {
+    if (FACTUAL_PATTERNS.some(p => p.test(s))) {
+      factual++;
+      if (/\[N\d+\]/.test(s)) cited++;
     }
   }
-
-  if (factualSentences === 0) {
-    return { score: 1.0, unsupportedClaims: 0 };
-  }
-
-  const supportRate = citedFactualSentences / factualSentences;
-  const unsupportedClaims = factualSentences - citedFactualSentences;
-
-  return {
-    score: supportRate,
-    unsupportedClaims,
-  };
+  return factual ? { score: cited / factual, unsupported: factual - cited } : { score: 1, unsupported: 0 };
 }
 
-/**
- * Determine confidence level from score
- */
-function getConfidenceLevel(score: number): ConfidenceBreakdown['confidenceLevel'] {
-  if (score >= THRESHOLDS.veryHigh) return 'very_high';
-  if (score >= THRESHOLDS.high) return 'high';
-  if (score >= THRESHOLDS.medium) return 'medium';
-  if (score >= THRESHOLDS.low) return 'low';
-  return 'very_low';
-}
+const getLevel = (s: number): ConfidenceBreakdown['confidenceLevel'] =>
+  s >= THRESHOLDS.veryHigh ? 'very_high' : s >= THRESHOLDS.high ? 'high' : s >= THRESHOLDS.medium ? 'medium' : s >= THRESHOLDS.low ? 'low' : 'very_low';
 
-/**
- * Calculate calibrated confidence score for a response
- */
-export function calculateResponseConfidence(
-  answer: string,
-  citations: Citation[],
-  chunks: ScoredChunk[],
-  intent: QueryIntent
-): ConfidenceBreakdown {
-  const calibrationFactors: string[] = [];
+export function calculateResponseConfidence(answer: string, citations: Citation[], chunks: ScoredChunk[], intent: QueryIntent): ConfidenceBreakdown {
+  const density = calcCitationDensity(answer);
+  const relevance = calcSourceRelevance(answer, citations, chunks);
+  const coherence = calcCoherence(answer, intent);
+  const support = calcClaimSupport(answer);
 
-  // Calculate component scores
-  const densityResult = calculateCitationDensity(answer);
-  const relevanceResult = calculateSourceRelevance(answer, citations, chunks);
-  const coherenceResult = calculateAnswerCoherence(answer, intent);
-  const supportResult = calculateClaimSupport(answer, citations);
+  const factors: string[] = [];
+  if (!density.cited) factors.push('No citations');
+  else if (density.score < 0.5) factors.push('Low citation density');
+  if (relevance.avg < 0.5) factors.push('Low source relevance');
+  factors.push(...coherence.issues);
+  if (support.unsupported) factors.push(`${support.unsupported} unsupported claims`);
 
-  // Collect calibration factors
-  if (densityResult.citedSentences === 0) {
-    calibrationFactors.push('No citations found');
-  } else if (densityResult.score < 0.5) {
-    calibrationFactors.push('Low citation density');
-  }
+  const overall = WEIGHTS.citationDensity * density.score + WEIGHTS.sourceRelevance * relevance.score +
+                  WEIGHTS.answerCoherence * coherence.score + WEIGHTS.claimSupport * support.score;
 
-  if (relevanceResult.averageScore < 0.5) {
-    calibrationFactors.push('Low source relevance');
-  }
-
-  if (coherenceResult.issues.length > 0) {
-    calibrationFactors.push(...coherenceResult.issues);
-  }
-
-  if (supportResult.unsupportedClaims > 0) {
-    calibrationFactors.push(`${supportResult.unsupportedClaims} unsupported claims`);
-  }
-
-  // Calculate weighted overall score
-  const overallConfidence =
-    WEIGHTS.citationDensity * densityResult.score +
-    WEIGHTS.sourceRelevance * relevanceResult.score +
-    WEIGHTS.answerCoherence * coherenceResult.score +
-    WEIGHTS.claimSupport * supportResult.score;
-
-  const confidenceLevel = getConfidenceLevel(overallConfidence);
-
-  // Log if confidence is low
-  if (overallConfidence < THRESHOLDS.medium) {
-    logWarn('Low response confidence', {
-      overallConfidence,
-      calibrationFactors,
-      citationDensity: densityResult.score,
-      sourceRelevance: relevanceResult.score,
-    });
+  if (overall < THRESHOLDS.medium) {
+    logWarn('Low confidence', { overall: round3(overall), factors });
   }
 
   return {
-    citationDensity: Math.round(densityResult.score * 1000) / 1000,
-    sourceRelevance: Math.round(relevanceResult.score * 1000) / 1000,
-    answerCoherence: Math.round(coherenceResult.score * 1000) / 1000,
-    claimSupport: Math.round(supportResult.score * 1000) / 1000,
-    overallConfidence: Math.round(overallConfidence * 1000) / 1000,
-    confidenceLevel,
-    calibrationFactors,
+    citationDensity: round3(density.score),
+    sourceRelevance: round3(relevance.score),
+    answerCoherence: round3(coherence.score),
+    claimSupport: round3(support.score),
+    overallConfidence: round3(overall),
+    confidenceLevel: getLevel(overall),
+    calibrationFactors: factors,
   };
 }
 
-/**
- * Get confidence summary for API response
- */
-export function getConfidenceSummary(breakdown: ConfidenceBreakdown): {
-  score: number;
-  level: string;
-  isReliable: boolean;
-  warnings: string[];
-} {
-  return {
-    score: breakdown.overallConfidence,
-    level: breakdown.confidenceLevel,
-    isReliable: breakdown.overallConfidence >= THRESHOLDS.medium,
-    warnings: breakdown.calibrationFactors,
-  };
-}
+export const getConfidenceSummary = (b: ConfidenceBreakdown) => ({
+  score: b.overallConfidence,
+  level: b.confidenceLevel,
+  isReliable: b.overallConfidence >= THRESHOLDS.medium,
+  warnings: b.calibrationFactors,
+});
 
-/**
- * Get confidence configuration for observability
- */
-export function getConfidenceConfig() {
-  return {
-    weights: { ...WEIGHTS },
-    thresholds: { ...THRESHOLDS },
-  };
-}
-
+export const getConfidenceConfig = () => ({ weights: { ...WEIGHTS }, thresholds: { ...THRESHOLDS } });

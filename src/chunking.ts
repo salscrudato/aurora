@@ -2,10 +2,16 @@
  * AuroraNotes API - Chunking Pipeline
  *
  * Splits notes into semantic chunks for embedding and retrieval.
- * Uses improved semantic boundary detection and context preservation.
+ * Uses semantic boundary detection with context overlap for citation accuracy.
+ *
+ * Key features:
+ * - Paragraph and sentence-aware splitting
+ * - Configurable chunk sizes with overlap for context preservation
+ * - Character offset tracking for precise citation anchoring
+ * - Idempotent processing (skips unchanged notes)
+ * - Vertex AI Vector Search integration
  */
 
-import { Timestamp } from "firebase-admin/firestore";
 import { getDb } from "./firestore";
 import {
   CHUNKS_COLLECTION,
@@ -22,31 +28,25 @@ import { hashText, estimateTokens, logInfo, logError, logWarn, extractTermsForIn
 import { generateEmbeddings, EmbeddingError } from "./embeddings";
 import { getVertexIndex, VertexDatapoint } from "./vectorIndex";
 
-// Semantic boundary pattern for splitting paragraphs
+// =============================================================================
+// Constants
+// =============================================================================
+
+/** Pattern for splitting text into paragraphs */
 const PARAGRAPH_BOUNDARY = /\n\n+/;
 
-/**
- * Split text into semantic units (paragraphs, then sentences)
- */
-function splitIntoSemanticUnits(text: string): string[] {
-  // First split by paragraphs
-  const paragraphs = text.split(PARAGRAPH_BOUNDARY).filter(p => p.trim());
+/** Pattern for splitting text into sentences */
+const SENTENCE_BOUNDARY = /(?<=[.!?])\s+/;
 
-  const units: string[] = [];
+/** Characters of context to include from adjacent chunks */
+const CONTEXT_WINDOW_SIZE = 100;
 
-  for (const para of paragraphs) {
-    // If paragraph is small enough, keep it as one unit
-    if (para.length <= CHUNK_TARGET_SIZE) {
-      units.push(para.trim());
-    } else {
-      // Split long paragraphs into sentences
-      const sentences = para.split(/(?<=[.!?])\s+/).filter(s => s.trim());
-      units.push(...sentences.map(s => s.trim()));
-    }
-  }
+/** Firestore batch size limit */
+const FIRESTORE_BATCH_SIZE = 400;
 
-  return units;
-}
+// =============================================================================
+// Types
+// =============================================================================
 
 /** Chunk with offset information for precise citation anchoring */
 export interface ChunkWithOffset {
@@ -54,6 +54,31 @@ export interface ChunkWithOffset {
   startOffset: number;
   endOffset: number;
   anchor: string;
+}
+
+// =============================================================================
+// Text Splitting Functions
+// =============================================================================
+
+/**
+ * Split text into semantic units (paragraphs, then sentences).
+ * Paragraphs are kept whole if under target size, otherwise split into sentences.
+ */
+function splitIntoSemanticUnits(text: string): string[] {
+  const paragraphs = text.split(PARAGRAPH_BOUNDARY).filter(p => p.trim());
+  const units: string[] = [];
+
+  for (const para of paragraphs) {
+    if (para.length <= CHUNK_TARGET_SIZE) {
+      units.push(para.trim());
+    } else {
+      // Split long paragraphs into sentences
+      const sentences = para.split(SENTENCE_BOUNDARY).filter(s => s.trim());
+      units.push(...sentences.map(s => s.trim()));
+    }
+  }
+
+  return units;
 }
 
 /**
@@ -167,8 +192,7 @@ function splitIntoChunksInternal(normalizedText: string): string[] {
 
     // Check if we're at a good size to finalize
     if (currentChunk.length >= CHUNK_TARGET_SIZE && currentChunk.length <= CHUNK_MAX_SIZE) {
-      // Look for a natural break point
-      const breakPoint = findNaturalBreak(currentChunk, CHUNK_TARGET_SIZE);
+      const breakPoint = findBestSplitPoint(currentChunk, CHUNK_TARGET_SIZE);
       if (breakPoint > CHUNK_MIN_SIZE && breakPoint < currentChunk.length - 50) {
         chunks.push(currentChunk.slice(0, breakPoint).trim());
         previousContext = extractOverlapContext(currentChunk.slice(0, breakPoint), CHUNK_OVERLAP);
@@ -251,22 +275,12 @@ function findBestSplitPoint(text: string, target: number): number {
   return target;
 }
 
-/**
- * Find a natural break point in text
- */
-function findNaturalBreak(text: string, target: number): number {
-  return findBestSplitPoint(text, target);
-}
+// =============================================================================
+// Note Processing
+// =============================================================================
 
 /**
- * Compute a hash of the full note text for idempotency checking
- */
-function computeNoteTextHash(text: string): string {
-  return hashText(text);
-}
-
-/**
- * Process a note into chunks and store them
+ * Process a note into chunks and store them.
  *
  * IDEMPOTENT: Skips processing if note text hasn't changed (based on hash).
  * Only regenerates embeddings for chunks that are missing them.
@@ -274,7 +288,6 @@ function computeNoteTextHash(text: string): string {
 export async function processNoteChunks(note: NoteDoc): Promise<void> {
   const db = getDb();
   const startTime = Date.now();
-  const noteTextHash = computeNoteTextHash(note.text);
 
   try {
     // Fetch existing chunks for this note (with fallback if index missing)
@@ -321,46 +334,9 @@ export async function processNoteChunks(note: NoteDoc): Promise<void> {
           return;
         }
 
-        // Only regenerate missing embeddings
-        if (EMBEDDINGS_ENABLED && chunksMissingEmbeddings.length > 0) {
-          logInfo('Regenerating missing embeddings', {
-            noteId: note.id,
-            missingCount: chunksMissingEmbeddings.length,
-            totalChunks: existingChunks.length,
-          });
-
-          try {
-            const textsToEmbed = chunksMissingEmbeddings.map(c => c.text);
-            const embeddings = await generateEmbeddings(textsToEmbed);
-
-            // generateEmbeddings now guarantees embeddings.length === textsToEmbed.length
-            // or throws EmbeddingError. Safe to iterate 1:1.
-            const batch = db.batch();
-            for (let i = 0; i < chunksMissingEmbeddings.length; i++) {
-              const chunkRef = db.collection(CHUNKS_COLLECTION).doc(chunksMissingEmbeddings[i].chunkId);
-              batch.update(chunkRef, {
-                embedding: embeddings[i],
-                embeddingModel: EMBEDDING_MODEL,
-              });
-            }
-            await batch.commit();
-
-            logInfo('Missing embeddings regenerated', {
-              noteId: note.id,
-              embeddingsAdded: chunksMissingEmbeddings.length,
-              elapsedMs: Date.now() - startTime,
-            });
-          } catch (err) {
-            // Log embedding errors with details but continue without embeddings
-            if (err instanceof EmbeddingError) {
-              logError('Embedding regeneration failed with misalignment', err, {
-                noteId: note.id,
-                missingIndices: err.missingIndices,
-              });
-            } else {
-              logError('Embedding regeneration failed', err, { noteId: note.id });
-            }
-          }
+        // Regenerate missing embeddings
+        if (EMBEDDINGS_ENABLED) {
+          await regenerateMissingEmbeddings(db, chunksMissingEmbeddings, note.id, startTime);
         }
         return;
       }
@@ -404,81 +380,16 @@ export async function processNoteChunks(note: NoteDoc): Promise<void> {
       return;
     }
 
-    // Create chunk documents with terms for lexical indexing, context windows, and offsets
-    const CONTEXT_WINDOW_SIZE = 100; // chars of context from prev/next chunk
-    const chunks: ChunkDoc[] = chunksWithOffsets.map((chunkData, position) => {
-      // Extract context from adjacent chunks for citation accuracy
-      const prevContext = position > 0
-        ? chunksWithOffsets[position - 1].text.slice(-CONTEXT_WINDOW_SIZE)
-        : null;  // Use null instead of undefined for Firestore compatibility
-      const nextContext = position < chunksWithOffsets.length - 1
-        ? chunksWithOffsets[position + 1].text.slice(0, CONTEXT_WINDOW_SIZE)
-        : null;  // Use null instead of undefined for Firestore compatibility
-
-      const chunk: ChunkDoc = {
-        chunkId: `${note.id}_${String(position).padStart(3, '0')}`,
-        noteId: note.id,
-        tenantId: note.tenantId,
-        text: chunkData.text,
-        textHash: hashText(chunkData.text),
-        position,
-        tokenEstimate: estimateTokens(chunkData.text),
-        createdAt: note.createdAt,
-        // Lexical indexing fields
-        terms: extractTermsForIndexing(chunkData.text),
-        termsVersion: TERMS_VERSION,
-        totalChunks: chunksWithOffsets.length,
-        // Character offsets for precise citation anchoring
-        startOffset: chunkData.startOffset,
-        endOffset: chunkData.endOffset,
-        anchor: chunkData.anchor,
-      };
-
-      // Only add context fields if they have values (Firestore doesn't accept undefined)
-      if (prevContext) chunk.prevContext = prevContext;
-      if (nextContext) chunk.nextContext = nextContext;
-
-      return chunk;
-    });
+    // Create chunk documents with context windows for citation accuracy
+    const chunks = buildChunkDocuments(note, chunksWithOffsets);
 
     // Generate embeddings if enabled
     if (EMBEDDINGS_ENABLED) {
-      try {
-        const textChunks = chunksWithOffsets.map(c => c.text);
-        const embeddings = await generateEmbeddings(textChunks);
-        // generateEmbeddings now guarantees embeddings.length === textChunks.length
-        // or throws EmbeddingError. Safe to iterate 1:1.
-        for (let i = 0; i < chunks.length; i++) {
-          chunks[i].embedding = embeddings[i];
-          chunks[i].embeddingModel = EMBEDDING_MODEL;
-        }
-      } catch (err) {
-        // Log embedding errors with details but continue without embeddings
-        if (err instanceof EmbeddingError) {
-          logError('Embedding generation failed with misalignment', err, {
-            noteId: note.id,
-            missingIndices: err.missingIndices,
-          });
-        } else {
-          logError('Embedding generation failed', err, { noteId: note.id });
-        }
-        // Continue without embeddings - retrieval will fall back to keyword search
-      }
+      await generateAndAttachEmbeddings(chunks, note.id);
     }
 
-    // Store chunks in batches (Firestore limit: 500 per batch)
-    const BATCH_SIZE = 400;
-    for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
-      const batch = db.batch();
-      const batchChunks = chunks.slice(i, i + BATCH_SIZE);
-
-      for (const chunk of batchChunks) {
-        const ref = db.collection(CHUNKS_COLLECTION).doc(chunk.chunkId);
-        batch.set(ref, chunk);
-      }
-
-      await batch.commit();
-    }
+    // Store chunks in batches
+    await storeChunksInBatches(db, chunks);
 
     // Sync to Vertex AI Vector Search if enabled
     await syncChunksToVertexIndex(chunks);
@@ -496,9 +407,7 @@ export async function processNoteChunks(note: NoteDoc): Promise<void> {
   }
 }
 
-/**
- * Get all chunks for a note
- */
+/** Get all chunks for a note, ordered by position */
 export async function getChunksForNote(noteId: string): Promise<ChunkDoc[]> {
   const db = getDb();
   const snap = await db
@@ -509,6 +418,145 @@ export async function getChunksForNote(noteId: string): Promise<ChunkDoc[]> {
 
   return snap.docs.map(d => d.data() as ChunkDoc);
 }
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+/**
+ * Build ChunkDoc objects from chunked text with offsets.
+ * Includes context windows from adjacent chunks for citation accuracy.
+ */
+function buildChunkDocuments(note: NoteDoc, chunksWithOffsets: ChunkWithOffset[]): ChunkDoc[] {
+  return chunksWithOffsets.map((chunkData, position) => {
+    const prevContext = position > 0
+      ? chunksWithOffsets[position - 1].text.slice(-CONTEXT_WINDOW_SIZE)
+      : null;
+    const nextContext = position < chunksWithOffsets.length - 1
+      ? chunksWithOffsets[position + 1].text.slice(0, CONTEXT_WINDOW_SIZE)
+      : null;
+
+    const chunk: ChunkDoc = {
+      chunkId: `${note.id}_${String(position).padStart(3, '0')}`,
+      noteId: note.id,
+      tenantId: note.tenantId,
+      text: chunkData.text,
+      textHash: hashText(chunkData.text),
+      position,
+      tokenEstimate: estimateTokens(chunkData.text),
+      createdAt: note.createdAt,
+      terms: extractTermsForIndexing(chunkData.text),
+      termsVersion: TERMS_VERSION,
+      totalChunks: chunksWithOffsets.length,
+      startOffset: chunkData.startOffset,
+      endOffset: chunkData.endOffset,
+      anchor: chunkData.anchor,
+    };
+
+    // Only add context fields if they have values (Firestore doesn't accept undefined)
+    if (prevContext) chunk.prevContext = prevContext;
+    if (nextContext) chunk.nextContext = nextContext;
+
+    return chunk;
+  });
+}
+
+/**
+ * Generate embeddings for chunks and attach them to the chunk documents.
+ * Logs errors but doesn't throw - retrieval falls back to keyword search.
+ */
+async function generateAndAttachEmbeddings(chunks: ChunkDoc[], noteId: string): Promise<void> {
+  try {
+    const texts = chunks.map(c => c.text);
+    const embeddings = await generateEmbeddings(texts);
+
+    for (let i = 0; i < chunks.length; i++) {
+      chunks[i].embedding = embeddings[i];
+      chunks[i].embeddingModel = EMBEDDING_MODEL;
+    }
+  } catch (err) {
+    logEmbeddingError(err, noteId);
+  }
+}
+
+/**
+ * Store chunks in Firestore using batched writes.
+ */
+async function storeChunksInBatches(
+  db: FirebaseFirestore.Firestore,
+  chunks: ChunkDoc[]
+): Promise<void> {
+  for (let i = 0; i < chunks.length; i += FIRESTORE_BATCH_SIZE) {
+    const batch = db.batch();
+    const batchChunks = chunks.slice(i, i + FIRESTORE_BATCH_SIZE);
+
+    for (const chunk of batchChunks) {
+      const ref = db.collection(CHUNKS_COLLECTION).doc(chunk.chunkId);
+      batch.set(ref, chunk);
+    }
+
+    await batch.commit();
+  }
+}
+
+/**
+ * Log embedding errors with appropriate context.
+ */
+function logEmbeddingError(err: unknown, noteId: string): void {
+  if (err instanceof EmbeddingError) {
+    logError('Embedding generation failed with misalignment', err, {
+      noteId,
+      missingIndices: err.missingIndices,
+    });
+  } else {
+    logError('Embedding generation failed', err, { noteId });
+  }
+}
+
+/**
+ * Regenerate embeddings for chunks that are missing them.
+ * Updates chunks in-place in Firestore.
+ */
+async function regenerateMissingEmbeddings(
+  db: FirebaseFirestore.Firestore,
+  chunks: ChunkDoc[],
+  noteId: string,
+  startTime: number
+): Promise<void> {
+  if (chunks.length === 0) return;
+
+  logInfo('Regenerating missing embeddings', {
+    noteId,
+    missingCount: chunks.length,
+  });
+
+  try {
+    const texts = chunks.map(c => c.text);
+    const embeddings = await generateEmbeddings(texts);
+
+    const batch = db.batch();
+    for (let i = 0; i < chunks.length; i++) {
+      const ref = db.collection(CHUNKS_COLLECTION).doc(chunks[i].chunkId);
+      batch.update(ref, {
+        embedding: embeddings[i],
+        embeddingModel: EMBEDDING_MODEL,
+      });
+    }
+    await batch.commit();
+
+    logInfo('Missing embeddings regenerated', {
+      noteId,
+      embeddingsAdded: chunks.length,
+      elapsedMs: Date.now() - startTime,
+    });
+  } catch (err) {
+    logEmbeddingError(err, noteId);
+  }
+}
+
+// =============================================================================
+// Vertex AI Integration
+// =============================================================================
 
 /**
  * Remove stale datapoints from Vertex index when chunks are replaced.
@@ -608,4 +656,3 @@ async function syncChunksToVertexIndex(chunks: ChunkDoc[]): Promise<void> {
     });
   }
 }
-

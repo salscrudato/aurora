@@ -12,57 +12,108 @@
  * This is the SINGLE canonical validation module for all citation operations.
  */
 
-import { logWarn, logInfo } from './utils';
+import { logWarn } from './utils';
 import { Citation, ScoredChunk } from './types';
 
 // Re-export Citation type for convenience
 export type { Citation } from './types';
 
-// Configuration for overlap verification
-const DEFAULT_MIN_OVERLAP_SCORE = 0.15;  // Min keyword overlap for validity
+// =============================================================================
+// Constants
+// =============================================================================
 
-/**
- * Result from citation validation pipeline
- */
+// Overlap verification thresholds
+const DEFAULT_MIN_OVERLAP_SCORE = 0.15;
+const SUSPICIOUS_SCORE_MULTIPLIER = 0.5;
+
+// Text analysis constants
+const MIN_SENTENCE_LENGTH = 15;
+const MIN_WORD_LENGTH = 2;
+const DEFAULT_COVERAGE_THRESHOLD = 50;
+
+// Pre-compiled regex patterns
+const CITATION_PATTERN = /\[N(\d+)\]/g;
+const SENTENCE_BOUNDARY = /(?<=[.!?])\s+/;
+const DUPLICATE_CITATIONS = /(\[N\d+\])(\s*\1)+/g;
+const SPACE_BEFORE_PUNCT = /\s+([.!?,;:])/g;
+const MULTI_SPACE_TAB = /[ \t]+/g;
+const MULTI_NEWLINE = /\n{3,}/g;
+const TRAILING_WHITESPACE = /[ \t]+$/gm;
+const EMPTY_BRACKETS = /\[\s*\]/g;
+const NON_WORD_CHARS = /[^\w\s]/g;
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/** Result from citation validation pipeline */
 export interface ValidationResult {
   validatedAnswer: string;
   validatedCitations: Citation[];
   invalidCitationsRemoved: string[];
-  droppedCitations: string[];        // Citations dropped due to low overlap
-  suspiciousCitations: string[];     // Citations with low but non-zero overlap
+  droppedCitations: string[];
+  suspiciousCitations: string[];
   citationCoveragePct: number;
   allCitationsValid: boolean;
   orderedByFirstAppearance: boolean;
-  overlapScores: Map<string, number>;  // Overlap scores for each citation
+  overlapScores: Map<string, number>;
 }
 
-/**
- * Options for citation validation
- */
+/** Options for citation validation */
 export interface ValidationOptions {
-  strictMode?: boolean;           // Drop citations below overlap threshold
-  minOverlapScore?: number;       // Min overlap score (default: 0.15)
-  verifyRelevance?: boolean;      // Whether to verify overlap (default: true)
-  requestId?: string;             // For logging
+  strictMode?: boolean;
+  minOverlapScore?: number;
+  verifyRelevance?: boolean;
+  requestId?: string;
 }
 
-/**
- * Parse citation tokens from answer text
- * Returns array of cid strings (e.g., "N1", "N2")
- */
+/** Result from relevance verification */
+interface RelevanceResult {
+  validCitations: Citation[];
+  droppedCitations: string[];
+  suspiciousCitations: string[];
+  overlapScores: Map<string, number>;
+}
+
+// Stop words for keyword extraction
+const STOP_WORDS = new Set([
+  'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+  'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+  'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as',
+  'and', 'or', 'but', 'if', 'this', 'that', 'these', 'those', 'it',
+  'based', 'notes', 'according', 'mentioned', 'stated', 'using', 'used'
+]);
+
+// =============================================================================
+// Text Normalization Helpers
+// =============================================================================
+
+/** Normalize whitespace while preserving newlines */
+function normalizeWhitespace(text: string): string {
+  return text
+    .replace(MULTI_SPACE_TAB, ' ')
+    .replace(MULTI_NEWLINE, '\n\n')
+    .replace(TRAILING_WHITESPACE, '')
+    .trim();
+}
+
+// =============================================================================
+// Citation Parsing Functions
+// =============================================================================
+
+/** Parse citation tokens from answer text */
 export function parseCitationTokens(answer: string): string[] {
-  const pattern = /\[N(\d+)\]/g;
   const tokens: string[] = [];
   let match;
-  while ((match = pattern.exec(answer)) !== null) {
+  // Reset lastIndex for global regex
+  CITATION_PATTERN.lastIndex = 0;
+  while ((match = CITATION_PATTERN.exec(answer)) !== null) {
     tokens.push(`N${match[1]}`);
   }
   return tokens;
 }
 
-/**
- * Get unique citation IDs in order of first appearance
- */
+/** Get unique citation IDs in order of first appearance */
 export function getOrderedUniqueCitations(answer: string): string[] {
   const tokens = parseCitationTokens(answer);
   const seen = new Set<string>();
@@ -76,92 +127,81 @@ export function getOrderedUniqueCitations(answer: string): string[] {
   return ordered;
 }
 
-/**
- * Remove invalid citation tokens from answer text while preserving formatting
- */
+/** Reorder citations array by order of first appearance in text */
+function reorderByFirstAppearance(cids: string[], citations: Citation[]): Citation[] {
+  const citationMap = new Map(citations.map(c => [c.cid, c]));
+  return cids
+    .map(cid => citationMap.get(cid))
+    .filter((c): c is Citation => c !== undefined);
+}
+
+// =============================================================================
+// Citation Cleanup Functions
+// =============================================================================
+
+/** Remove invalid citation tokens from answer text while preserving formatting */
 export function removeInvalidCitations(
   answer: string,
   validCids: Set<string>
 ): { cleaned: string; removed: string[] } {
   const removed: string[] = [];
 
-  const cleaned = answer.replace(/\[N(\d+)\]/g, (match, num) => {
+  const cleaned = answer.replace(CITATION_PATTERN, (match, num) => {
     const cid = `N${num}`;
     if (validCids.has(cid)) {
-      return match; // Keep valid citation
-    } else {
-      removed.push(cid);
-      return ''; // Remove invalid citation
+      return match;
     }
+    removed.push(cid);
+    return '';
   });
 
-  // Clean up extra spaces/tabs without destroying newlines
-  const normalized = cleaned
-    .replace(/[ \t]+/g, ' ')         // Collapse multiple spaces/tabs to single space
-    .replace(/\n{3,}/g, '\n\n')      // Normalize multiple newlines to double
-    .replace(/[ \t]+$/gm, '')        // Trim trailing whitespace from each line
-    .trim();
-
-  return { cleaned: normalized, removed };
+  return { cleaned: normalizeWhitespace(cleaned), removed };
 }
 
-/**
- * Calculate citation coverage: % of factual sentences with citations
- */
+/** Clean up citation formatting issues in answer while preserving newlines */
+export function cleanCitationFormatting(answer: string): string {
+  return normalizeWhitespace(
+    answer
+      .replace(DUPLICATE_CITATIONS, '$1')
+      .replace(SPACE_BEFORE_PUNCT, '$1')
+      .replace(EMPTY_BRACKETS, '')
+  );
+}
+
+// =============================================================================
+// Coverage Metrics
+// =============================================================================
+
+/** Calculate citation coverage: % of factual sentences with citations */
 export function calculateCitationCoverage(answer: string): number {
-  // Split into sentences
   const sentences = answer
-    .split(/(?<=[.!?])\s+/)
+    .split(SENTENCE_BOUNDARY)
     .map(s => s.trim())
-    .filter(s => s.length > 15); // Substantial sentences only
+    .filter(s => s.length > MIN_SENTENCE_LENGTH);
 
   if (sentences.length === 0) return 100;
 
-  // Count sentences with at least one citation
-  const citedCount = sentences.filter(s => /\[N\d+\]/.test(s)).length;
+  const citedCount = sentences.filter(s => CITATION_PATTERN.test(s)).length;
+  // Reset lastIndex after test
+  CITATION_PATTERN.lastIndex = 0;
 
   return Math.round((citedCount / sentences.length) * 100);
 }
 
-/**
- * Clean up citation formatting issues in answer while preserving newlines
- */
-export function cleanCitationFormatting(answer: string): string {
-  return answer
-    // Remove duplicate adjacent citations [N1][N1] -> [N1]
-    .replace(/(\[N\d+\])(\s*\1)+/g, '$1')
-    // Clean up spaces around citations: "word [N1] ." -> "word [N1]."
-    .replace(/\s+([.!?,;:])/g, '$1')
-    // Collapse multiple spaces/tabs on same line (preserve newlines)
-    .replace(/[ \t]+/g, ' ')
-    // Normalize multiple consecutive newlines to double newline (paragraph break)
-    .replace(/\n{3,}/g, '\n\n')
-    // Trim trailing whitespace from each line
-    .replace(/[ \t]+$/gm, '')
-    // Remove any leftover empty brackets
-    .replace(/\[\s*\]/g, '')
-    .trim();
-}
+// =============================================================================
+// Keyword Extraction & Overlap
+// =============================================================================
 
-// Stop words for keyword extraction
-const STOP_WORDS = new Set([
-  'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-  'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-  'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as',
-  'and', 'or', 'but', 'if', 'this', 'that', 'these', 'those', 'it',
-  'based', 'notes', 'according', 'mentioned', 'stated', 'using', 'used'
-]);
-
-/**
- * Extract keywords from text for overlap verification
- */
+/** Extract keywords from text for overlap verification */
 export function extractVerificationKeywords(text: string): Set<string> {
+  // Reset lastIndex for global regex
+  CITATION_PATTERN.lastIndex = 0;
   return new Set(
     text.toLowerCase()
-      .replace(/\[N\d+\]/g, '') // Remove citation markers
-      .replace(/[^\w\s]/g, ' ')
+      .replace(CITATION_PATTERN, '')
+      .replace(NON_WORD_CHARS, ' ')
       .split(/\s+/)
-      .filter(word => word.length > 2 && !STOP_WORDS.has(word))
+      .filter(word => word.length > MIN_WORD_LENGTH && !STOP_WORDS.has(word))
   );
 }
 
@@ -177,59 +217,127 @@ export function calculateOverlapScore(set1: Set<string>, set2: Set<string>): num
     if (set2.has(word)) intersection++;
   }
 
-  const minSize = Math.min(set1.size, set2.size);
-  return intersection / minSize;
+  return intersection / Math.min(set1.size, set2.size);
 }
 
-/**
- * Verify citation relevance using keyword overlap
- * Returns citations that have sufficient keyword overlap with the answer
- */
+/** Classify a single citation based on overlap score */
+function classifyCitation(
+  citation: Citation,
+  overlapScore: number,
+  minOverlapScore: number,
+  strictMode: boolean,
+  result: RelevanceResult
+): void {
+  result.overlapScores.set(citation.cid, overlapScore);
+
+  if (overlapScore >= minOverlapScore) {
+    result.validCitations.push(citation);
+  } else if (strictMode) {
+    result.droppedCitations.push(citation.cid);
+  } else {
+    result.validCitations.push(citation);
+    if (overlapScore < minOverlapScore * SUSPICIOUS_SCORE_MULTIPLIER) {
+      result.suspiciousCitations.push(citation.cid);
+    }
+  }
+}
+
+/** Verify citation relevance using keyword overlap */
 export function verifyCitationRelevance(
   answer: string,
   citations: Citation[],
   chunks: ScoredChunk[],
   options: { strictMode?: boolean; minOverlapScore?: number } = {}
-): {
-  validCitations: Citation[];
-  droppedCitations: string[];
-  suspiciousCitations: string[];
-  overlapScores: Map<string, number>;
-} {
+): RelevanceResult {
   const { strictMode = true, minOverlapScore = DEFAULT_MIN_OVERLAP_SCORE } = options;
 
   const answerKeywords = extractVerificationKeywords(answer);
-  const validCitations: Citation[] = [];
-  const droppedCitations: string[] = [];
-  const suspiciousCitations: string[] = [];
-  const overlapScores = new Map<string, number>();
+  const chunkMap = new Map(chunks.map(c => [c.chunkId, c]));
+
+  const result: RelevanceResult = {
+    validCitations: [],
+    droppedCitations: [],
+    suspiciousCitations: [],
+    overlapScores: new Map(),
+  };
 
   for (const citation of citations) {
-    // Find the full chunk text for this citation
-    const chunk = chunks.find(c => c.chunkId === citation.chunkId);
+    const chunk = chunkMap.get(citation.chunkId);
     const sourceText = chunk?.text || citation.snippet;
     const sourceKeywords = extractVerificationKeywords(sourceText);
-
-    // Calculate overlap score (0 to 1)
     const overlapScore = calculateOverlapScore(answerKeywords, sourceKeywords);
-    overlapScores.set(citation.cid, overlapScore);
 
-    if (overlapScore >= minOverlapScore) {
-      validCitations.push(citation);
-    } else if (overlapScore === 0 && strictMode) {
-      droppedCitations.push(citation.cid);
-    } else if (overlapScore < minOverlapScore && strictMode) {
-      droppedCitations.push(citation.cid);
-    } else {
-      validCitations.push(citation);
-      if (overlapScore < minOverlapScore * 0.5) {
-        suspiciousCitations.push(citation.cid);
-      }
-    }
+    classifyCitation(citation, overlapScore, minOverlapScore, strictMode, result);
   }
 
-  return { validCitations, droppedCitations, suspiciousCitations, overlapScores };
+  return result;
 }
+
+// =============================================================================
+// Core Validation Helpers
+// =============================================================================
+
+/** Common validation steps: remove invalid, clean formatting, get ordered citations */
+function performBaseValidation(
+  answer: string,
+  citations: Citation[],
+  requestId: string
+): {
+  cleanedAnswer: string;
+  removed: string[];
+  orderedCitations: Citation[];
+  usedCids: string[];
+} {
+  const validCids = new Set(citations.map(c => c.cid));
+
+  // Step 1: Remove invalid citations
+  const { cleaned, removed } = removeInvalidCitations(answer, validCids);
+
+  if (removed.length > 0) {
+    logWarn('Removed invalid citations from answer', {
+      requestId,
+      removedCount: removed.length,
+      removedCids: removed,
+    });
+  }
+
+  // Step 2: Clean formatting
+  const cleanedAnswer = cleanCitationFormatting(cleaned);
+
+  // Step 3: Get citations in order of appearance
+  const usedCids = getOrderedUniqueCitations(cleanedAnswer);
+  const usedCidSet = new Set(usedCids);
+  const usedCitations = citations.filter(c => usedCidSet.has(c.cid));
+  const orderedCitations = reorderByFirstAppearance(usedCids, usedCitations);
+
+  return { cleanedAnswer, removed, orderedCitations, usedCids };
+}
+
+/** Build final validation result */
+function buildValidationResult(
+  cleanedAnswer: string,
+  validatedCitations: Citation[],
+  removed: string[],
+  droppedCitations: string[] = [],
+  suspiciousCitations: string[] = [],
+  overlapScores: Map<string, number> = new Map()
+): ValidationResult {
+  return {
+    validatedAnswer: cleanedAnswer,
+    validatedCitations,
+    invalidCitationsRemoved: removed,
+    droppedCitations,
+    suspiciousCitations,
+    citationCoveragePct: calculateCitationCoverage(cleanedAnswer),
+    allCitationsValid: removed.length === 0 && droppedCitations.length === 0,
+    orderedByFirstAppearance: true,
+    overlapScores,
+  };
+}
+
+// =============================================================================
+// Public API
+// =============================================================================
 
 /**
  * Full citation validation pipeline
@@ -240,11 +348,6 @@ export function verifyCitationRelevance(
  * 3. Reorder by first appearance
  * 4. Optionally verify overlap relevance
  * 5. Calculate coverage metrics
- *
- * @param answer - The LLM answer text
- * @param citations - Available citations from sources
- * @param chunks - Full chunk data for overlap verification
- * @param options - Validation options
  */
 export function validateCitationsWithChunks(
   answer: string,
@@ -259,74 +362,36 @@ export function validateCitationsWithChunks(
     requestId = 'unknown'
   } = options;
 
-  // Build map of valid cids
-  const validCids = new Set(citations.map(c => c.cid));
+  const { cleanedAnswer, removed, orderedCitations } = performBaseValidation(
+    answer, citations, requestId
+  );
 
-  // Step 1: Remove invalid citations
-  const { cleaned: cleanedInvalid, removed } = removeInvalidCitations(answer, validCids);
+  // Step 4: Verify overlap relevance (optional)
+  if (!verifyRelevance || orderedCitations.length === 0) {
+    return buildValidationResult(cleanedAnswer, orderedCitations, removed);
+  }
 
-  if (removed.length > 0) {
-    logWarn('Removed invalid citations from answer', {
+  const relevanceResult = verifyCitationRelevance(cleanedAnswer, orderedCitations, chunks, {
+    strictMode,
+    minOverlapScore,
+  });
+
+  if (relevanceResult.droppedCitations.length > 0) {
+    logWarn('Dropped unsupported citations (low keyword overlap)', {
       requestId,
-      removedCount: removed.length,
-      removedCids: removed,
+      droppedCitations: relevanceResult.droppedCitations,
+      threshold: minOverlapScore,
     });
   }
 
-  // Step 2: Clean formatting
-  const cleanedAnswer = cleanCitationFormatting(cleanedInvalid);
-
-  // Step 3: Get citations actually used in the answer (in order)
-  const usedCids = getOrderedUniqueCitations(cleanedAnswer);
-  const usedCidSet = new Set(usedCids);
-
-  // Filter citations to only those actually cited
-  let usedCitations = citations.filter(c => usedCidSet.has(c.cid));
-
-  // Reorder by first appearance
-  usedCitations = usedCids
-    .map(cid => usedCitations.find(c => c.cid === cid))
-    .filter((c): c is Citation => c !== undefined);
-
-  // Step 4: Verify overlap relevance
-  let droppedCitations: string[] = [];
-  let suspiciousCitations: string[] = [];
-  let overlapScores = new Map<string, number>();
-
-  if (verifyRelevance && usedCitations.length > 0) {
-    const verifyResult = verifyCitationRelevance(cleanedAnswer, usedCitations, chunks, {
-      strictMode,
-      minOverlapScore,
-    });
-
-    usedCitations = verifyResult.validCitations;
-    droppedCitations = verifyResult.droppedCitations;
-    suspiciousCitations = verifyResult.suspiciousCitations;
-    overlapScores = verifyResult.overlapScores;
-
-    if (droppedCitations.length > 0) {
-      logWarn('Dropped unsupported citations (low keyword overlap)', {
-        requestId,
-        droppedCitations,
-        threshold: minOverlapScore,
-      });
-    }
-  }
-
-  // Step 5: Calculate coverage
-  const coveragePct = calculateCitationCoverage(cleanedAnswer);
-
-  return {
-    validatedAnswer: cleanedAnswer,
-    validatedCitations: usedCitations,
-    invalidCitationsRemoved: removed,
-    droppedCitations,
-    suspiciousCitations,
-    citationCoveragePct: coveragePct,
-    allCitationsValid: removed.length === 0 && droppedCitations.length === 0,
-    orderedByFirstAppearance: true,
-    overlapScores,
-  };
+  return buildValidationResult(
+    cleanedAnswer,
+    relevanceResult.validCitations,
+    removed,
+    relevanceResult.droppedCitations,
+    relevanceResult.suspiciousCitations,
+    relevanceResult.overlapScores
+  );
 }
 
 /**
@@ -338,55 +403,21 @@ export function validateCitations(
   citations: Citation[],
   requestId: string
 ): ValidationResult {
-  // Use simplified validation without chunk data (no overlap verification)
-  const validCids = new Set(citations.map(c => c.cid));
-  const { cleaned, removed } = removeInvalidCitations(answer, validCids);
-
-  if (removed.length > 0) {
-    logWarn('Removed invalid citations from answer', {
-      requestId,
-      removedCount: removed.length,
-      removedCids: removed,
-    });
-  }
-
-  const cleanedAnswer = cleanCitationFormatting(cleaned);
-  const usedCids = getOrderedUniqueCitations(cleanedAnswer);
-  const usedCidSet = new Set(usedCids);
-  const usedCitations = citations.filter(c => usedCidSet.has(c.cid));
-
-  const orderedCitations = usedCids
-    .map(cid => usedCitations.find(c => c.cid === cid))
-    .filter((c): c is Citation => c !== undefined);
-
-  const coveragePct = calculateCitationCoverage(cleanedAnswer);
-
-  return {
-    validatedAnswer: cleanedAnswer,
-    validatedCitations: orderedCitations,
-    invalidCitationsRemoved: removed,
-    droppedCitations: [],
-    suspiciousCitations: [],
-    citationCoveragePct: coveragePct,
-    allCitationsValid: removed.length === 0,
-    orderedByFirstAppearance: true,
-    overlapScores: new Map(),
-  };
+  const { cleanedAnswer, removed, orderedCitations } = performBaseValidation(
+    answer, citations, requestId
+  );
+  return buildValidationResult(cleanedAnswer, orderedCitations, removed);
 }
 
-/**
- * Check if answer needs regeneration due to low citation coverage
- */
+/** Check if answer needs regeneration due to low citation coverage */
 export function needsRegeneration(
   coveragePct: number,
-  threshold: number = 50
+  threshold: number = DEFAULT_COVERAGE_THRESHOLD
 ): boolean {
   return coveragePct < threshold;
 }
 
-/**
- * Calculate source utilization: % of available sources that were cited
- */
+/** Calculate source utilization: % of available sources that were cited */
 export function calculateSourceUtilization(
   usedCitationCount: number,
   totalSourceCount: number
@@ -394,4 +425,3 @@ export function calculateSourceUtilization(
   if (totalSourceCount === 0) return 100;
   return Math.round((usedCitationCount / totalSourceCount) * 100);
 }
-
