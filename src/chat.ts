@@ -478,19 +478,22 @@ const PROMPT_TEMPLATES = {
   START: `You are a helpful assistant answering questions from the user's personal notes.
 
 ## Your Task
-Answer the user's question using ONLY the information in the sources below. If the sources don't contain relevant information, say "I don't have notes about that."
+Answer the user's question using ONLY the information in the sources below. **Provide a COMPREHENSIVE response that cites ALL relevant sources.** If the sources don't contain relevant information, say "I don't have notes about that."
 
 ## Response Guidelines
-1. **Be natural and conversational** - Write like you're explaining to a friend, not listing facts
-2. **Structure for readability** - Use bullet points or numbered lists when listing multiple items
-3. **Lead with the answer** - Start with the most important information first
-4. **Be concise** - Don't repeat information; synthesize related points
+1. **CITE ALL RELEVANT SOURCES** - Every source containing related information must be cited
+2. **Synthesize comprehensively** - Combine information from ALL sources to give a complete answer
+3. **Be natural and conversational** - Write like you're explaining to a friend
+4. **Structure for readability** - Use bullet points or numbered lists when listing multiple items
+5. **Lead with the answer** - Start with the most important information first
 
 ## How to Cite
-- Add citations at the END of each paragraph or logical section, not after every sentence
-- Use format: [N1] or [N1][N2] for multiple sources
-- Only cite when introducing NEW information from a source
-- Example: "React Hooks let you use state in functional components. useState manages local state, while useEffect handles side effects like API calls. [N1]"
+- Cite ALL sources that contain relevant information: [N1][N3][N5]
+- Add citations at the END of each paragraph or logical section
+- Use format: [N1] or [N1][N2][N3] for multiple sources
+- Example: "React Hooks let you use state in functional components. useState manages local state, while useEffect handles side effects like API calls. [N1][N2][N4]"
+
+**CRITICAL:** Do not omit any source that adds useful information. The user wants to see EVERYTHING their notes contain about this topic.
 
 ## Formatting
 `,
@@ -595,20 +598,21 @@ function buildCitationRepairPrompt(
 
   return `Fix the citations in this answer. Use ONLY [N1], [N2], etc. matching the sources below.
 ${invalidFeedback}
-AVAILABLE SOURCES (use ONLY these):
+AVAILABLE SOURCES (use ONLY these - cite ALL that are relevant):
 ${citationList}
 
 ANSWER TO FIX:
 ${originalAnswer}
 
 STRICT RULES:
-1. Every factual claim MUST have a citation [N#] immediately after it
-2. Only use citation IDs that exist in the sources above
-3. Each citation must ACTUALLY support the claim (don't cite randomly)
-4. Don't change the meaning or add new information
-5. If a claim has no supporting source, either remove the claim or state "according to my notes" without a citation
+1. CITE ALL SOURCES that contain relevant information - do not omit any
+2. Every factual claim MUST have a citation [N#] immediately after it
+3. Only use citation IDs that exist in the sources above
+4. Each citation must ACTUALLY support the claim (don't cite randomly)
+5. Don't change the meaning or add new information
+6. Combine citations for related claims: [N1][N3][N5]
 
-REWRITE WITH CORRECT CITATIONS:`;
+REWRITE WITH COMPREHENSIVE CITATIONS:`;
 }
 
 // =============================================================================

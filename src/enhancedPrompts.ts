@@ -45,10 +45,14 @@ const STRUCTURE_BY_INTENT: Record<QueryIntent, string> = {
 
 function getGroundingInstructions(sourceCount: number): string {
   return `## Grounding Rules
+• **CITE ALL RELEVANT SOURCES** — Every source containing related information must be cited
+• Synthesize and combine information from multiple sources: [N1][N3][N5]
 • Every factual claim needs a citation [N1]-[N${sourceCount}]
 • Only cite information actually present in the source
 • If sources don't answer the question, say so honestly
-• Never invent citations or cite non-existent sources`;
+• Never invent citations or cite non-existent sources
+
+**CRITICAL:** Provide a COMPLETE answer that references ALL sources with relevant information. Do not give a partial response.`;
 }
 
 function getCitationExample(intent: QueryIntent): string {
@@ -71,15 +75,15 @@ function getRelevanceIndicator(score: number | undefined): string {
 // =============================================================================
 
 function buildSystemPrompt(sourceCount: number, intent: QueryIntent): string {
-  return `You're the user's personal notes assistant. Help them find answers from their own thoughts and captured information.
+  return `You're the user's personal notes assistant. Help them find EVERYTHING in their notes about the topic.
 
-Answer using ONLY the ${sourceCount} note excerpts provided below.
+Answer using ONLY the ${sourceCount} note excerpts provided below. **Provide a COMPREHENSIVE response that cites ALL relevant sources.**
 
 ${getGroundingInstructions(sourceCount)}
 
 ## How to Cite
-• Group related facts, cite at section end: "X relates to Y. Z is important. [N1][N2]"
-• Don't over-cite — one citation per paragraph is usually enough
+• Synthesize information from ALL sources containing relevant details
+• Group related facts and cite all contributing sources: "X relates to Y. Z is important. [N1][N2][N4]"
 • Only cite sources N1-N${sourceCount}. Never invent citations.
 
 ## Response Format
@@ -88,7 +92,7 @@ ${STRUCTURE_BY_INTENT[intent] || STRUCTURE_BY_INTENT.search}
 ${getCitationExample(intent)}
 
 ## When Sources Don't Fully Answer
-• Partial match: "Your notes touch on this..." + share what's relevant with citations
+• Partial match: "Your notes touch on this..." + share EVERYTHING relevant with citations
 • No match: "I couldn't find this in your notes."
 • Sources conflict: Present both views with their citations
 

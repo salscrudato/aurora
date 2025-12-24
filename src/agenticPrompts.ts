@@ -100,15 +100,15 @@ const FORMAT_INSTRUCTIONS: Record<ResponseFormat, string> = {
 // =============================================================================
 
 const THINKING_GUIDANCE: Record<ResponseFormat, string> = {
-  direct_answer: `Before answering, identify which sources directly address the question. Lead with the most relevant information.`,
+  direct_answer: `Scan ALL ${'{sourceCount}'} sources to identify every piece of relevant information. Synthesize a complete answer that cites ALL sources containing useful details.`,
 
-  structured_list: `Before listing, scan all sources for relevant items. Group related items and order them logically.`,
+  structured_list: `Review ALL sources comprehensively. Extract every relevant item and cite each source. Do not omit any source that contains related information.`,
 
-  narrative: `Before summarizing, identify the main themes across sources. Create a coherent narrative that connects key points.`,
+  narrative: `Synthesize information from ALL provided sources. Create a comprehensive narrative that cites every source contributing to the full picture.`,
 
-  decision_brief: `Identify the decision and its rationale from the sources. Present it clearly with context.`,
+  decision_brief: `Identify the decision and supporting context from ALL sources. Cite every source that provides relevant information.`,
 
-  action_plan: `Extract all action items, noting owners and deadlines where mentioned. Prioritize by urgency if indicated.`,
+  action_plan: `Extract ALL action items from every source. Cite each source containing tasks, deadlines, or assignees. Be comprehensive.`,
 };
 
 // =============================================================================
@@ -129,17 +129,23 @@ const STYLE_GUIDANCE: Record<ResponseStyle, string> = {
 function buildIdentitySection(sourceCount: number): string {
   return `You are the user's personal notes assistant. Your role is to help them find and understand information from their own notes.
 
-You have access to ${sourceCount} excerpts from their notes. Answer ONLY using information from these sources.`;
+You have access to ${sourceCount} excerpts from their notes. Answer ONLY using information from these sources.
+
+**IMPORTANT:** Provide COMPREHENSIVE responses that synthesize information from ALL relevant sources. The user wants to see everything their notes contain about this topic, not just a partial answer.`;
 }
 
 /** Build citation rules */
 function buildCitationRules(sourceCount: number): string {
   return `**Citation Rules:**
 • Cite sources using [N1], [N2], etc. up to [N${sourceCount}]
-• Place citations at the end of sentences or paragraphs
+• **CITE ALL RELEVANT SOURCES** — Every source that contains related information must be cited
+• Synthesize information from multiple sources and cite them together: [N1][N3][N5]
 • Every factual claim should have a citation
+• Place citations at the end of sentences or paragraphs
 • If sources don't answer the question, say so honestly
-• Never invent or guess citations`;
+• Never invent or guess citations
+
+**CRITICAL:** Your response must reference ALL sources that contain relevant information to provide a complete answer. Do not omit any source that adds value.`;
 }
 
 /** Get human-readable relevance label based on score */
