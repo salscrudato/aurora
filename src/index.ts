@@ -13,8 +13,9 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import compression from "compression";
+import { FieldValue } from "firebase-admin/firestore";
 
-import { PORT, PROJECT_ID, DEFAULT_TENANT_ID, NOTES_COLLECTION } from "./config";
+import { PORT, PROJECT_ID, NOTES_COLLECTION, INTEGRATION_TEST_SECRET } from "./config";
 import { createNote, listNotes, updateNote, deleteNote, getNote, searchNotes, getAutocompleteSuggestions } from "./notes";
 import type { ListNotesOptions } from "./notes";
 import {
@@ -40,6 +41,7 @@ import { logInfo, logError, logWarn, generateRequestId, withRequestContext, isVa
 import { ChatRequest, NoteDoc } from "./types";
 import { processNoteChunks } from "./chunking";
 import { getDb } from "./firestore";
+import { getCacheStats } from "./cache";
 import { internalAuthMiddleware, isInternalAuthConfigured } from "./internalAuth";
 import { getVertexConfigStatus, isVertexConfigured } from "./vectorIndex";
 import { isGenAIAvailable } from "./genaiClient";
@@ -56,6 +58,7 @@ import {
   AutocompleteQuerySchema,
   ChatRequestSchema,
   CreateThreadSchema,
+  CreateThreadWithMessageSchema,
   ThreadIdParamSchema,
   ListThreadsQuerySchema,
   UpdateThreadSchema,
@@ -220,11 +223,134 @@ app.get("/metrics", (_req, res) => {
       rssMB: Math.round(memUsage.rss / 1024 / 1024 * 100) / 100,
       externalMB: Math.round(memUsage.external / 1024 / 1024 * 100) / 100,
     },
+    cache: getCacheStats(),
     rateLimiting: getRateLimiterStats(),
     nodeVersion: process.version,
     platform: process.platform,
   });
 });
+
+// ============================================
+// Integration Test Endpoints (secret-key auth)
+// ============================================
+
+/**
+ * Integration test middleware - validates secret key
+ * Only enabled when INTEGRATION_TEST_SECRET is set
+ */
+const integrationTestAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (!INTEGRATION_TEST_SECRET) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+
+  const providedSecret = req.headers['x-integration-test-secret'] as string;
+  if (!providedSecret || providedSecret !== INTEGRATION_TEST_SECRET) {
+    res.status(401).json({ error: 'Invalid integration test secret' });
+    return;
+  }
+
+  // Set a synthetic user for testing
+  const testUserId = req.headers['x-test-user-id'] as string || `test-user-${Date.now()}`;
+  req.user = {
+    uid: testUserId,
+    email: `${testUserId}@integration-test.local`,
+    emailVerified: true,
+    provider: 'integration-test',
+  };
+
+  next();
+};
+
+/**
+ * POST /_internal/test/notes - Create a test note (for integration testing)
+ * Requires: X-Integration-Test-Secret header
+ */
+app.post(
+  "/_internal/test/notes",
+  integrationTestAuth,
+  validateBody(CreateNoteSchema),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.user!.uid;
+    const { title, content, tags, metadata } = req.body;
+    const note = await createNote(content, tenantId, { title, tags, metadata });
+    logInfo('Integration test: created note', { noteId: note.id, tenantId });
+    res.status(201).json(note);
+  })
+);
+
+/**
+ * POST /_internal/test/chat - Test chat endpoint (for integration testing)
+ * Requires: X-Integration-Test-Secret header
+ */
+app.post(
+  "/_internal/test/chat",
+  integrationTestAuth,
+  validateBody(ChatRequestSchema),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.user!.uid;
+    const { message, conversationHistory } = req.body;
+
+    // Use the enhanced chat for testing
+    const result = await generateEnhancedChatResponse({
+      query: message,
+      tenantId,
+      conversationHistory,
+    });
+
+    logInfo('Integration test: chat response', {
+      tenantId,
+      messageLength: message.length,
+      answerLength: result.answer.length,
+      sourcesCount: result.sources?.length || 0,
+    });
+
+    // Return in standard chat response format
+    res.status(200).json({
+      response: result.answer,
+      sources: result.sources,
+      meta: result.meta,
+    });
+  })
+);
+
+/**
+ * DELETE /_internal/test/notes/:noteId - Delete a test note (for integration testing)
+ * Requires: X-Integration-Test-Secret header
+ */
+app.delete(
+  "/_internal/test/notes/:noteId",
+  integrationTestAuth,
+  validateParams(NoteIdParamSchema),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.user!.uid;
+    const { noteId } = req.params;
+    const result = await deleteNote(noteId, tenantId);
+
+    if (!result) {
+      res.status(404).json({ error: 'Note not found' });
+      return;
+    }
+
+    logInfo('Integration test: deleted note', { noteId, tenantId });
+    res.status(200).json(result);
+  })
+);
+
+/**
+ * GET /_internal/test/notes - List test notes (for integration testing)
+ * Requires: X-Integration-Test-Secret header
+ */
+app.get(
+  "/_internal/test/notes",
+  integrationTestAuth,
+  asyncHandler(async (req, res) => {
+    const tenantId = req.user!.uid;
+    const notes = await listNotes(tenantId, 100);
+    logInfo('Integration test: listed notes', { tenantId, count: notes.notes.length });
+    res.status(200).json(notes);
+  })
+);
 
 // ============================================
 // Notes Endpoints (authenticated)
@@ -969,6 +1095,49 @@ app.post(
 );
 
 /**
+ * POST /threads:createWithMessage - Create thread with initial message
+ *
+ * Convenience endpoint that creates a thread and adds the first user message
+ * in a single request. Reduces round-trips for the common "start new chat" flow.
+ *
+ * Requires: Firebase ID token in Authorization header
+ * Request: { message: string, title?: string, metadata?: object }
+ * Response: { thread: ThreadResponse, message: MessageResponse }
+ */
+app.post(
+  "/threads:createWithMessage",
+  userAuthMiddleware,
+  perUserRateLimiter,
+  validateBody(CreateThreadWithMessageSchema),
+  asyncHandler(async (req, res) => {
+    const tenantId = req.user!.uid;
+    const { title, message, metadata } = req.body;
+
+    // Create thread
+    const thread = await createThread(tenantId, { title, metadata });
+
+    // Add initial user message
+    const msg = await addMessage(thread.id, tenantId, 'user', message);
+    if (!msg) {
+      throw Errors.internal('Failed to add initial message');
+    }
+
+    res.status(201).json({
+      thread: {
+        ...thread,
+        messageCount: 1,
+      },
+      message: {
+        id: msg.id,
+        role: msg.role,
+        content: msg.content,
+        createdAt: new Date().toISOString(),
+      },
+    });
+  })
+);
+
+/**
  * GET /threads - List conversation threads
  *
  * Requires: Firebase ID token in Authorization header
@@ -1105,10 +1274,13 @@ if (!isInternalAuthConfigured()) {
  *
  * This endpoint is called by Cloud Tasks to process note chunks/embeddings.
  * When INTERNAL_AUTH_ENABLED=true, validates OIDC token from Cloud Tasks.
+ *
+ * Supports idempotency via idempotencyKey - if the note's processingStatus
+ * is already 'ready', we skip reprocessing.
  */
 app.post("/internal/process-note", internalAuthMiddleware, async (req, res) => {
   try {
-    const { noteId, tenantId } = req.body;
+    const { noteId, tenantId, action, idempotencyKey } = req.body;
 
     if (!noteId) {
       return res.status(400).json({ error: "noteId is required" });
@@ -1116,7 +1288,8 @@ app.post("/internal/process-note", internalAuthMiddleware, async (req, res) => {
 
     // Fetch the note from Firestore
     const db = getDb();
-    const noteDoc = await db.collection(NOTES_COLLECTION).doc(noteId).get();
+    const noteRef = db.collection(NOTES_COLLECTION).doc(noteId);
+    const noteDoc = await noteRef.get();
 
     if (!noteDoc.exists) {
       logWarn("Note not found for processing", { noteId });
@@ -1132,11 +1305,40 @@ app.post("/internal/process-note", internalAuthMiddleware, async (req, res) => {
       return res.status(200).json({ status: "tenant_mismatch", noteId });
     }
 
-    // Process the note chunks
-    await processNoteChunks(note);
+    // Idempotency check: skip if already processed
+    if (note.processingStatus === 'ready') {
+      logInfo("Note already processed (idempotent skip)", { noteId, idempotencyKey });
+      return res.status(200).json({ status: "already_processed", noteId });
+    }
 
-    logInfo("Note processed via Cloud Tasks", { noteId });
-    return res.status(200).json({ status: "processed", noteId });
+    // Update status to 'processing'
+    await noteRef.update({
+      processingStatus: 'processing',
+      processingUpdatedAt: FieldValue.serverTimestamp(),
+    });
+
+    try {
+      // Process the note chunks
+      await processNoteChunks(note);
+
+      // Update status to 'ready'
+      await noteRef.update({
+        processingStatus: 'ready',
+        processingError: FieldValue.delete(),
+        processingUpdatedAt: FieldValue.serverTimestamp(),
+      });
+
+      logInfo("Note processed via Cloud Tasks", { noteId, action, idempotencyKey });
+      return res.status(200).json({ status: "processed", noteId });
+    } catch (processingErr) {
+      // Update status to 'failed' with error message
+      await noteRef.update({
+        processingStatus: 'failed',
+        processingError: processingErr instanceof Error ? processingErr.message : 'Unknown error',
+        processingUpdatedAt: FieldValue.serverTimestamp(),
+      });
+      throw processingErr;
+    }
   } catch (err) {
     logError("POST /internal/process-note error", err);
     // Return 500 to trigger Cloud Tasks retry

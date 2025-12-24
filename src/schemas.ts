@@ -133,6 +133,14 @@ export type ChatRequestInput = z.infer<typeof ChatRequestSchema>;
 export const CreateThreadSchema = z.object({ title: z.string().min(1).max(200).optional(), metadata: z.record(z.string(), z.unknown()).optional() });
 export type CreateThreadInput = z.infer<typeof CreateThreadSchema>;
 
+/** Schema for creating a thread with an initial message in one call */
+export const CreateThreadWithMessageSchema = z.object({
+  title: z.string().min(1).max(200).optional(),
+  message: z.string().min(1).max(10000),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+});
+export type CreateThreadWithMessageInput = z.infer<typeof CreateThreadWithMessageSchema>;
+
 export const ThreadIdParamSchema = z.object({ threadId: z.string().min(1, 'Thread ID is required') });
 export type ThreadIdParam = z.infer<typeof ThreadIdParamSchema>;
 

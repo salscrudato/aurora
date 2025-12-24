@@ -142,11 +142,17 @@ async function fetchCandidates(tenantId: string, maxAgeDays: number, limit: numb
     logError('Optimized chunk query failed, using fallback', err);
   }
 
-  // Fallback: fetch all and filter client-side
-  const snap = await db.collection(CHUNKS_COLLECTION).orderBy('createdAt', 'desc').limit(limit * 2).get();
+  // Fallback: still use tenantId filter at DB level for security
+  // Note: This fallback should rarely be hit - indicates missing index
+  logWarn('Using fallback chunk query without date filter', { tenantId });
+  const snap = await db.collection(CHUNKS_COLLECTION)
+    .where('tenantId', '==', tenantId)
+    .orderBy('createdAt', 'desc')
+    .limit(limit * 2)
+    .get();
   return snap.docs
-    .map(d => { const data = d.data() as ChunkDoc; if (!data.tenantId) data.tenantId = 'public'; return data; })
-    .filter(c => c.tenantId === tenantId && (c.createdAt instanceof Timestamp ? c.createdAt.toDate() : new Date()) >= cutoffDate)
+    .map(d => d.data() as ChunkDoc)
+    .filter(c => (c.createdAt instanceof Timestamp ? c.createdAt.toDate() : new Date()) >= cutoffDate)
     .slice(0, limit);
 }
 

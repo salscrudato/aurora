@@ -8,20 +8,38 @@ export type NoteType = 'meeting' | 'idea' | 'task' | 'reference' | 'journal' | '
 export interface ActionItem { text: string; completed: boolean; dueDate?: string; }
 export interface Entity { text: string; type: 'person' | 'organization' | 'location' | 'date' | 'product' | 'other'; }
 
+/** Attachment metadata for files uploaded with notes */
+export interface AttachmentMeta {
+  filename: string;
+  mimeType: string;
+  storagePath: string;
+  size?: number;
+  createdAt: Timestamp | string;
+  uploadedAt?: Timestamp | string;
+}
+
 export interface NoteDoc {
   id: string; title?: string; text: string; tenantId: string;
-  processingStatus?: ProcessingStatus; processingError?: string;
+  processingStatus?: ProcessingStatus; processingError?: string; processingUpdatedAt?: Timestamp | FieldValue;
   tags?: string[]; metadata?: Record<string, unknown>;
   summary?: string; noteType?: NoteType; actionItems?: ActionItem[]; entities?: Entity[];
   enrichmentStatus?: ProcessingStatus;
+  /** Attachments uploaded with this note */
+  attachments?: AttachmentMeta[];
+  /** Source of note content: 'manual' (typed), 'upload' (extracted from file) */
+  contentSource?: 'manual' | 'upload';
   createdAt: Timestamp | FieldValue; updatedAt: Timestamp | FieldValue;
 }
 
 export interface NoteResponse {
   id: string; title?: string; text: string; tenantId: string;
-  processingStatus?: ProcessingStatus; tags?: string[]; metadata?: Record<string, unknown>;
+  processingStatus?: ProcessingStatus; processingError?: string; processingUpdatedAt?: string;
+  tags?: string[]; metadata?: Record<string, unknown>;
   summary?: string; noteType?: NoteType; actionItems?: ActionItem[]; entities?: Entity[];
-  enrichmentStatus?: ProcessingStatus; createdAt: string; updatedAt: string;
+  enrichmentStatus?: ProcessingStatus;
+  attachments?: Array<{ filename: string; mimeType: string; size?: number; createdAt: string }>;
+  contentSource?: 'manual' | 'upload';
+  createdAt: string; updatedAt: string;
 }
 
 export interface NotesListResponse { notes: NoteResponse[]; cursor: string | null; hasMore: boolean; }
@@ -93,7 +111,19 @@ export interface QueryAnalysis {
 }
 
 export interface NoteFilterOptions {
-  noteIds?: string[]; excludeNoteIds?: string[]; tags?: string[]; dateFrom?: Date; dateTo?: Date;
+  noteIds?: string[];
+  excludeNoteIds?: string[];
+  tags?: string[];
+  excludeTags?: string[];
+  noteTypes?: NoteType[];
+  dateFrom?: Date;
+  dateTo?: Date;
+  /** Only include notes with attachments */
+  hasAttachments?: boolean;
+  /** Filter by content source */
+  contentSource?: 'manual' | 'upload';
+  /** Custom metadata filters (key-value pairs) */
+  metadata?: Record<string, unknown>;
 }
 
 export interface RetrievalOptions {

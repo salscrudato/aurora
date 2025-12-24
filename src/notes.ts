@@ -5,7 +5,7 @@
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { v4 as uuidv4 } from "uuid";
 import { getDb } from "./firestore";
-import { NOTES_COLLECTION, MAX_NOTE_LENGTH, DEFAULT_TENANT_ID, NOTES_PAGE_LIMIT, MAX_NOTES_PAGE_LIMIT, CHUNKS_COLLECTION } from "./config";
+import { NOTES_COLLECTION, MAX_NOTE_LENGTH, LEGACY_DEFAULT_TENANT_ID, NOTES_PAGE_LIMIT, MAX_NOTES_PAGE_LIMIT, CHUNKS_COLLECTION } from "./config";
 import { NoteDoc, NoteResponse, NotesListResponse, DeleteNoteResponse } from "./types";
 import { timestampToISO, parseCursor, encodeCursor, logInfo, logError, logWarn, sanitizeText, isValidTenantId } from "./utils";
 import { processNoteChunks } from "./chunking";
@@ -34,6 +34,8 @@ function docToResponse(doc: NoteDoc): NoteResponse {
     text: doc.text,
     tenantId: doc.tenantId,
     processingStatus: doc.processingStatus,
+    processingError: doc.processingError,
+    processingUpdatedAt: doc.processingUpdatedAt ? timestampToISO(doc.processingUpdatedAt) : undefined,
     tags: doc.tags,
     metadata: doc.metadata,
     summary: doc.summary,
@@ -41,6 +43,13 @@ function docToResponse(doc: NoteDoc): NoteResponse {
     actionItems: doc.actionItems,
     entities: doc.entities,
     enrichmentStatus: doc.enrichmentStatus,
+    attachments: doc.attachments?.map(a => ({
+      filename: a.filename,
+      mimeType: a.mimeType,
+      size: a.size,
+      createdAt: typeof a.createdAt === 'string' ? a.createdAt : timestampToISO(a.createdAt),
+    })),
+    contentSource: doc.contentSource,
     createdAt: timestampToISO(doc.createdAt),
     updatedAt: timestampToISO(doc.updatedAt),
   };
@@ -52,9 +61,10 @@ function docToResponse(doc: NoteDoc): NoteResponse {
 
 export async function createNote(
   text: string,
-  tenantId: string = DEFAULT_TENANT_ID,
+  tenantId: string,
   options: CreateNoteOptions = {}
 ): Promise<NoteResponse> {
+  if (!tenantId) throw new Error('tenantId is required');
   const trimmedText = sanitizeText(text, MAX_NOTE_LENGTH + 100).trim();
   if (!trimmedText) throw new Error('text is required');
   if (trimmedText.length > MAX_NOTE_LENGTH) throw new Error(`text too long (max ${MAX_NOTE_LENGTH})`);
@@ -125,11 +135,12 @@ export interface ListNotesOptions {
 }
 
 export async function listNotes(
-  tenantId: string = DEFAULT_TENANT_ID,
+  tenantId: string,
   limit: number = NOTES_PAGE_LIMIT,
   cursor?: string,
   options: ListNotesOptions = {}
 ): Promise<NotesListResponse> {
+  if (!tenantId) throw new Error('tenantId is required');
   const db = getDb();
   const pageLimit = Math.min(Math.max(1, limit), MAX_NOTES_PAGE_LIMIT);
   const cursorData = parseCursor(cursor);
@@ -207,7 +218,8 @@ async function listNotesOptimized(
   query = query.limit(needsClientFiltering ? pageLimit * 3 : pageLimit + 1);
 
   const snap = await query.get();
-  let docs = snap.docs.map(d => ({ ...d.data() as NoteDoc, tenantId: (d.data() as NoteDoc).tenantId || DEFAULT_TENANT_ID }));
+  // tenantId is already filtered at DB level via where clause - do not fallback to 'public'
+  let docs = snap.docs.map(d => d.data() as NoteDoc);
   if (needsClientFiltering) docs = applyClientSideFilters(docs, options, allTags.length > 1 ? allTags : []);
 
   const hasMore = docs.length > pageLimit;
@@ -229,13 +241,15 @@ async function listNotesLegacy(
   const sortBy = options.sortBy || 'createdAt';
   const order = options.order || 'desc';
 
-  let query: FirebaseFirestore.Query = db.collection(NOTES_COLLECTION).orderBy('createdAt', 'desc').limit(pageLimit * 5);
+  // SECURITY: Always filter by tenantId at DB level - never fetch all docs
+  let query: FirebaseFirestore.Query = db.collection(NOTES_COLLECTION)
+    .where('tenantId', '==', tenantId)
+    .orderBy('createdAt', 'desc')
+    .limit(pageLimit * 5);
   if (cursorData) query = query.startAfter(Timestamp.fromDate(cursorData.createdAt));
 
   const snap = await query.get();
-  let docs = snap.docs
-    .map(d => ({ ...d.data() as NoteDoc, tenantId: (d.data() as NoteDoc).tenantId || DEFAULT_TENANT_ID }))
-    .filter(d => d.tenantId === tenantId);
+  let docs = snap.docs.map(d => d.data() as NoteDoc);
 
   docs = applyClientSideFilters(docs, options, allTags);
   if (sortBy !== 'createdAt' || order !== 'desc') docs = sortNotes(docs, sortBy, order);
@@ -252,11 +266,13 @@ async function listNotesLegacy(
 // Get Note
 // =============================================================================
 
-export async function getNote(noteId: string, tenantId: string = DEFAULT_TENANT_ID): Promise<NoteResponse | null> {
+export async function getNote(noteId: string, tenantId: string): Promise<NoteResponse | null> {
+  if (!tenantId) throw new Error('tenantId is required');
   const db = getDb();
   const doc = await db.collection(NOTES_COLLECTION).doc(noteId).get();
   if (!doc.exists) return null;
   const data = doc.data() as NoteDoc;
+  // SECURITY: Always verify tenant ownership at application level
   return data.tenantId === tenantId ? docToResponse(data) : null;
 }
 
@@ -273,10 +289,11 @@ interface UpdateNoteOptions {
 
 export async function updateNote(
   noteId: string,
-  tenantId: string = DEFAULT_TENANT_ID,
+  tenantId: string,
   options: UpdateNoteOptions = {}
 ): Promise<NoteResponse | null> {
   if (!noteId || typeof noteId !== 'string') throw new Error('noteId is required');
+  if (!tenantId) throw new Error('tenantId is required');
   if (!isValidTenantId(tenantId)) throw new Error('invalid tenantId format');
   if (!options.text && !options.title && !options.tags && !options.metadata) {
     throw new Error('at least one field must be provided for update');
@@ -359,8 +376,9 @@ async function deleteAndReprocessChunks(
 // Delete Note
 // =============================================================================
 
-export async function deleteNote(noteId: string, tenantId: string = DEFAULT_TENANT_ID): Promise<DeleteNoteResponse | null> {
+export async function deleteNote(noteId: string, tenantId: string): Promise<DeleteNoteResponse | null> {
   if (!noteId || typeof noteId !== 'string') throw new Error('noteId is required');
+  if (!tenantId) throw new Error('tenantId is required');
   if (!isValidTenantId(tenantId)) throw new Error('invalid tenantId format');
 
   const db = getDb();
@@ -454,9 +472,10 @@ function highlightMatches(text: string, query: string): string {
 
 export async function searchNotes(
   query: string,
-  tenantId: string = DEFAULT_TENANT_ID,
+  tenantId: string,
   options: SearchNotesOptions = {}
 ): Promise<SearchNotesResponse> {
+  if (!tenantId) throw new Error('tenantId is required');
   const startTime = Date.now();
   const limit = Math.min(options.limit || 10, 50);
   const threshold = options.threshold ?? 0.1;
@@ -602,9 +621,10 @@ interface AutocompleteOptions {
 
 export async function getAutocompleteSuggestions(
   prefix: string,
-  tenantId: string = DEFAULT_TENANT_ID,
+  tenantId: string,
   options: AutocompleteOptions = {}
 ): Promise<AutocompleteResponse> {
+  if (!tenantId) throw new Error('tenantId is required');
   const startTime = Date.now();
   const limit = Math.min(options.limit || 5, 20);
   const types = options.types || ['note', 'tag', 'title'];

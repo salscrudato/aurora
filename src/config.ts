@@ -49,7 +49,11 @@ export const CHUNKS_COLLECTION = envString('CHUNKS_COLLECTION', 'noteChunks');
 // =============================================================================
 
 export const MAX_NOTE_LENGTH = envInt('MAX_NOTE_LENGTH', 5000);
-export const DEFAULT_TENANT_ID = envString('DEFAULT_TENANT_ID', 'public');
+/**
+ * @deprecated NEVER use in production paths. Only for migrations/backfill.
+ * All user-facing code must derive tenantId from authenticated user's UID.
+ */
+export const LEGACY_DEFAULT_TENANT_ID = 'public';
 export const NOTES_PAGE_LIMIT = envInt('NOTES_PAGE_LIMIT', 50);
 export const MAX_NOTES_PAGE_LIMIT = 100;
 
@@ -204,3 +208,16 @@ export const RRF_USE_WEIGHTED = envBool('RRF_USE_WEIGHTED', true);
 // =============================================================================
 
 export const STREAMING_ENABLED = envBool('STREAMING_ENABLED', true);
+
+// =============================================================================
+// Integration Testing (for CI/CD pipelines)
+// =============================================================================
+
+/**
+ * Secret key for internal integration testing.
+ * When set, allows POST /_internal/test endpoints to bypass user auth.
+ * Generate with: openssl rand -hex 32
+ *
+ * SECURITY: Keep this secret! Only use for automated testing.
+ */
+export const INTEGRATION_TEST_SECRET = envString('INTEGRATION_TEST_SECRET', '');

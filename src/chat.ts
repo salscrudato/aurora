@@ -18,7 +18,6 @@ import {
   CHAT_TOP_K,
   LLM_MAX_OUTPUT_TOKENS,
   RETRIEVAL_TOP_K,
-  DEFAULT_TENANT_ID,
   LLM_CONTEXT_BUDGET_CHARS,
   LLM_CONTEXT_RESERVE_CHARS,
   CITATION_RETRY_ENABLED,
@@ -630,7 +629,16 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
 
   // Sanitize and validate input
   const query = sanitizeText(request.message, CHAT_MAX_QUERY_LENGTH + 100).trim();
-  const tenantId = request.tenantId || DEFAULT_TENANT_ID;
+  const tenantId = request.tenantId;
+
+  // SECURITY: tenantId is required - never fall back to 'public'
+  if (!tenantId) {
+    throw new Error('tenantId is required');
+  }
+
+  if (!isValidTenantId(tenantId)) {
+    throw new Error('invalid tenantId format');
+  }
 
   // Initialize structured retrieval log (generate requestId if not provided)
   const retrievalLog = createRetrievalLog(tenantId, query) as RetrievalLogEntry;
@@ -655,10 +663,6 @@ export async function generateChatResponse(request: ChatRequest): Promise<ChatRe
 
   if (query.length > CHAT_MAX_QUERY_LENGTH) {
     throw new Error(`message too long (max ${CHAT_MAX_QUERY_LENGTH} chars)`);
-  }
-
-  if (!isValidTenantId(tenantId)) {
-    throw new Error('invalid tenantId format');
   }
 
   // Analyze query for intent and keywords

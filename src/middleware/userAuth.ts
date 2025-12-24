@@ -53,14 +53,41 @@ import { logInfo, logWarn, logError, hashText } from '../utils';
 // =============================================================================
 
 /**
- * Whether user authentication is enabled
- * Default to false for backwards compatibility during migration
- * Set USER_AUTH_ENABLED=true in production when ready to enforce auth
+ * Environment detection for security guards
  */
-const USER_AUTH_ENABLED = process.env.USER_AUTH_ENABLED === 'true';
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const IS_PRODUCTION = NODE_ENV === 'production';
+
+/**
+ * Whether user authentication is enabled
+ *
+ * SECURITY: In production, this MUST always be true.
+ * The DEV_USER bypass is only allowed in development environments.
+ */
+const USER_AUTH_ENABLED_RAW = process.env.USER_AUTH_ENABLED === 'true';
+
+// CRITICAL SECURITY GUARD: Force auth enabled in production
+const USER_AUTH_ENABLED = IS_PRODUCTION ? true : USER_AUTH_ENABLED_RAW;
+
+// Startup validation - log loud warning if auth is disabled
+if (!USER_AUTH_ENABLED && !IS_PRODUCTION) {
+  console.warn('\n' + '⚠️'.repeat(30));
+  console.warn('⚠️  WARNING: USER_AUTH_ENABLED=false - Using development bypass');
+  console.warn('⚠️  This is ONLY acceptable in local development!');
+  console.warn('⚠️  Set USER_AUTH_ENABLED=true before deploying.');
+  console.warn('⚠️'.repeat(30) + '\n');
+}
+
+// Crash immediately if someone tries to disable auth in production
+if (IS_PRODUCTION && process.env.USER_AUTH_ENABLED === 'false') {
+  console.error('🚨 CRITICAL: Cannot disable USER_AUTH_ENABLED in production!');
+  console.error('🚨 This is a security violation. Refusing to start.');
+  process.exit(1);
+}
 
 /**
  * Default development user for local testing
+ * SECURITY: This user is NEVER used in production - see guards above.
  */
 const DEV_USER: AuthenticatedUser = {
   uid: 'dev-user-local',
@@ -346,13 +373,14 @@ export async function userAuthMiddleware(
   res: Response,
   next: NextFunction
 ): Promise<void> {
-  // Development mode bypass
-  if (!USER_AUTH_ENABLED) {
+  // Development mode bypass - ONLY works in non-production (see guards above)
+  if (!USER_AUTH_ENABLED && !IS_PRODUCTION) {
     req.user = { ...DEV_USER };
-    logInfo('User auth disabled, using dev user', {
+    logInfo('User auth disabled, using dev user (DEV ONLY)', {
       path: req.path,
       method: req.method,
       uid: req.user.uid,
+      NODE_ENV,
     });
     return next();
   }
@@ -442,8 +470,8 @@ export async function optionalAuthMiddleware(
   res: Response,
   next: NextFunction
 ): Promise<void> {
-  // Development mode
-  if (!USER_AUTH_ENABLED) {
+  // Development mode bypass - ONLY works in non-production
+  if (!USER_AUTH_ENABLED && !IS_PRODUCTION) {
     req.user = { ...DEV_USER };
     return next();
   }

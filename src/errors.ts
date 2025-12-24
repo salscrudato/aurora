@@ -64,6 +64,9 @@ export const Errors = {
 
   threadNotFound: (threadId?: string) =>
     new ApiError(ErrorCode.THREAD_NOT_FOUND, 'Thread not found', threadId ? { threadId } : undefined),
+
+  internal: (message: string = 'An unexpected error occurred', details?: Record<string, unknown>) =>
+    new ApiError(ErrorCode.INTERNAL_ERROR, message, details),
 };
 
 // =============================================================================
